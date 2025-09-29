@@ -1,0 +1,487 @@
+import cv2
+import numpy as np
+from collections import deque
+import threading
+import time
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from scipy.spatial.distance import cdist
+from matplotlib.colors import hsv_to_rgb
+import csv
+
+video_path = "" # Remember to add the local video path!
+cap = cv2.VideoCapture(video_path)
+
+if not cap.isOpened():
+    raise FileNotFoundError("Video not found")
+
+particle_areas_history = []
+frame_numbers = []
+max_history_length = 100
+
+class Particle:
+    def __init__(self, id, centroid, area, bbox):
+        self.id = id
+        self.centroid = centroid
+        self.area = area
+        self.bbox = bbox
+        self.last_seen = 0
+        self.trajectory = [centroid]
+        self.areas_history = [area]
+        self.frame_history = [0] 
+        self.alive = True
+        self.color = self.generate_color()
+    
+    def generate_color(self):
+        hue = (self.id * 137.5) % 360
+        saturation = 0.7 + (self.id % 3) * 0.1 
+        value = 0.8 + (self.id % 2) * 0.2
+        rgb = hsv_to_rgb([hue/360, saturation, value])
+        return rgb
+    
+    def update(self, centroid, area, bbox, frame_num):
+        self.centroid = centroid
+        self.area = area
+        self.bbox = bbox
+        self.last_seen = frame_num
+        self.trajectory.append(centroid)
+        self.areas_history.append(area)
+        self.frame_history.append(frame_num)
+        if len(self.trajectory) > 50:
+            self.trajectory.pop(0)
+            self.areas_history.pop(0)
+            self.frame_history.pop(0)
+
+tracked_particles = []
+next_particle_id = 1
+total_unique_particles = 0
+max_distance_threshold = 50
+max_frames_disappeared = 10
+
+plot_update_interval = 5
+last_plot_update = 0
+
+def setup_plot():
+    plt.ion()  # Turn on interactive mode
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.set_xlabel('Frame Number')
+    ax.set_ylabel('Particle Area (pixels²)')
+    ax.set_title('Real-time Particle Area Tracking')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig, ax
+
+def update_plot(ax, current_frame):
+    ax.clear()
+    ax.set_xlabel('Frame Number')
+    ax.set_ylabel('Particle Area (pixels²)')
+    ax.set_title(f'Real-time Particle Area Tracking (Frame {current_frame})')
+    ax.grid(True, alpha=0.3)
+    
+    alive_count = 0
+    for particle in tracked_particles:
+        if particle.alive and len(particle.areas_history) > 1:
+            alive_count += 1
+            ax.plot(particle.frame_history, particle.areas_history, 
+                   color=particle.color, linewidth=2, alpha=0.8,
+                   label=f'Particle {particle.id}')
+            
+            if particle.frame_history:
+                ax.plot(particle.frame_history[-1], particle.areas_history[-1], 
+                       'o', color=particle.color, markersize=6)
+    
+    for particle in tracked_particles:
+        if not particle.alive and current_frame - particle.last_seen <= 30:
+            if len(particle.areas_history) > 1:
+                ax.plot(particle.frame_history, particle.areas_history, 
+                       color=particle.color, linewidth=1, alpha=0.3,
+                       linestyle='--', label=f'Particle {particle.id} (ended)')
+    
+    # Set axis limits
+    if tracked_particles:
+        max_frame = max([max(p.frame_history) if p.frame_history else 0 for p in tracked_particles])
+        all_areas = []
+        for p in tracked_particles:
+            all_areas.extend(p.areas_history)
+        
+        if all_areas:
+            ax.set_xlim(max(0, max_frame - 200), max_frame + 10)
+            ax.set_ylim(min(all_areas) * 0.9, max(all_areas) * 1.1)
+    
+
+    handles, labels = ax.get_legend_handles_labels()
+    if len(handles) <= 15:
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+    
+    stats_text = f'Active Particles: {alive_count}\nTotal Unique: {total_unique_particles}'
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    plt.tight_layout()
+    plt.draw()
+    plt.pause(0.001)
+
+def calculate_centroid(contour):
+    M = cv2.moments(contour)
+    if M["m00"] != 0:
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        return (cx, cy)
+    return (0, 0)
+
+def track_particles(current_detections, frame_num):
+    global tracked_particles, next_particle_id, total_unique_particles
+    
+    if not current_detections:
+        for particle in tracked_particles:
+            if particle.alive and frame_num - particle.last_seen > max_frames_disappeared:
+                particle.alive = False
+        return []
+    
+    current_centroids = [det['centroid'] for det in current_detections]
+    
+    if not tracked_particles:
+        for detection in current_detections:
+            particle = Particle(
+                next_particle_id,
+                detection['centroid'],
+                detection['area'],
+                detection['bbox']
+            )
+            particle.last_seen = frame_num
+            particle.frame_history[0] = frame_num
+            tracked_particles.append(particle)
+            next_particle_id += 1
+            total_unique_particles += 1
+        return tracked_particles
+    
+    existing_centroids = []
+    alive_particles = []
+    for particle in tracked_particles:
+        if particle.alive:
+            existing_centroids.append(particle.centroid)
+            alive_particles.append(particle)
+    
+    if not existing_centroids:
+        for detection in current_detections:
+            particle = Particle(
+                next_particle_id,
+                detection['centroid'],
+                detection['area'],
+                detection['bbox']
+            )
+            particle.last_seen = frame_num
+            particle.frame_history[0] = frame_num
+            tracked_particles.append(particle)
+            next_particle_id += 1
+            total_unique_particles += 1
+        return tracked_particles
+    
+    distances = cdist(existing_centroids, current_centroids)
+    
+    matched_pairs = []
+    used_detections = set()
+    used_particles = set()
+    
+    while True:
+        min_distance = float('inf')
+        best_particle_idx = -1
+        best_detection_idx = -1
+        
+        for p_idx in range(len(alive_particles)):
+            if p_idx in used_particles:
+                continue
+            for d_idx in range(len(current_detections)):
+                if d_idx in used_detections:
+                    continue
+                if distances[p_idx][d_idx] < min_distance:
+                    min_distance = distances[p_idx][d_idx]
+                    best_particle_idx = p_idx
+                    best_detection_idx = d_idx
+        
+        if min_distance < max_distance_threshold and best_particle_idx != -1:
+            matched_pairs.append((best_particle_idx, best_detection_idx))
+            used_particles.add(best_particle_idx)
+            used_detections.add(best_detection_idx)
+        else:
+            break
+    
+    for p_idx, d_idx in matched_pairs:
+        particle = alive_particles[p_idx]
+        detection = current_detections[d_idx]
+        particle.update(
+            detection['centroid'],
+            detection['area'],
+            detection['bbox'],
+            frame_num
+        )
+    
+    for p_idx, particle in enumerate(alive_particles):
+        if p_idx not in used_particles:
+            if frame_num - particle.last_seen > max_frames_disappeared:
+                particle.alive = False
+    
+    for d_idx, detection in enumerate(current_detections):
+        if d_idx not in used_detections:
+            particle = Particle(
+                next_particle_id,
+                detection['centroid'],
+                detection['area'],
+                detection['bbox']
+            )
+            particle.last_seen = frame_num
+            particle.frame_history[0] = frame_num
+            tracked_particles.append(particle)
+            next_particle_id += 1
+            total_unique_particles += 1
+    
+    return tracked_particles
+
+def process_frame(image, frame_num):
+    x1, y1 = 262, 239
+    x2, y2 = 370, 365
+    ogHeight, ogWidth = image.shape
+    width, height = (x2 - x1), (y2 - y1)
+    enlargementWidth = width/ogWidth
+    enlargementHeight = height/ogHeight
+    croppedFrame = image[y1:y2, x1:x2]
+    
+    blurred = cv2.GaussianBlur(croppedFrame, (7, 7), 0)
+
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    if np.sum(thresh == 255) > np.sum(thresh == 0):
+        thresh = cv2.bitwise_not(thresh)
+
+    kernel = np.ones((2, 2), np.uint8)
+    opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    sure_bg = cv2.dilate(opening, kernel, iterations=2)
+
+    dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+    _, sure_fg = cv2.threshold(dist_transform, 0.2 * dist_transform.max(), 255, 0)
+    sure_fg = np.uint8(sure_fg)
+
+    unknown = cv2.subtract(sure_bg, sure_fg)
+
+    _, markers = cv2.connectedComponents(sure_fg)
+
+    markers = markers + 1
+
+    markers[unknown == 255] = 0
+
+    color_image = cv2.cvtColor(croppedFrame, cv2.COLOR_GRAY2BGR)
+
+    markers = cv2.watershed(color_image, markers)
+
+    output_image = color_image.copy()
+    output_image[markers == -1] = [0, 0, 255]  # red boundaries
+
+    current_detections = []
+    MIN_AREA = 10
+    
+    for marker_val in np.unique(markers):
+        if marker_val <= 1:
+            continue
+        mask = np.uint8(markers == marker_val)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            area = area * enlargementHeight * enlargementWidth
+            taylor_parameter = 0
+            (x, y), (widthRect, heightRect), angle = cv2.minAreaRect(cnt)
+
+            major_axis = max(widthRect, heightRect)
+            minor_axis = min(widthRect, heightRect)
+
+            if (major_axis + minor_axis != 0):
+                taylor_parameter = (major_axis - minor_axis) / (major_axis + minor_axis)
+
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter > 0 and area >= MIN_AREA:
+                centroid = calculate_centroid(cnt)
+                bbox = cv2.boundingRect(cnt)
+                
+                detection = {
+                    'contour': cnt,
+                    'area': area,
+                    'centroid': centroid,
+                    'bbox': bbox,
+                    'taylor parameter': taylor_parameter
+                }
+                current_detections.append(detection)
+    
+    tracked = track_particles(current_detections, frame_num)
+    
+    current_particle_count = 0
+    particle_areas = []
+    
+    for particle in tracked:
+        if particle.alive and frame_num - particle.last_seen <= 1:
+            current_particle_count += 1
+            particle_areas.append(particle.area)
+            
+            for detection in current_detections:
+                if detection['centroid'] == particle.centroid:
+                    cv2.drawContours(output_image, [detection['contour']], -1, (0, 255, 0), 2)
+                    
+                    x, y = particle.centroid
+                    cv2.putText(output_image, f'ID:{particle.id}', 
+                              (x-20, y-15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                    cv2.putText(output_image, f'{int(particle.area)}', 
+                              (x-20, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                    
+                    if len(particle.trajectory) > 1:
+                        pts = np.array(particle.trajectory, np.int32)
+                        cv2.polylines(output_image, [pts], False, (255, 0, 255), 1)
+                    
+                    cv2.circle(output_image, particle.centroid, 3, (0, 255, 255), -1)
+                    break
+
+    return output_image, current_particle_count, particle_areas
+
+def save_particle_areas_to_csv(tracked_particles, filename):
+    if not tracked_particles:
+        print("No particles to save!")
+        return
+    
+    # Find the maximum frame number
+    max_frame = 0
+    for particle in tracked_particles:
+        if particle.frame_history:
+            max_frame = max(max_frame, max(particle.frame_history))
+    
+    # Structure of duictionary: {frame_num: {particle_id: area}}
+    frame_data = {}
+    for frame_num in range(max_frame + 1):
+        frame_data[frame_num] = {}
+    
+    for particle in tracked_particles:
+        for i, frame_num in enumerate(particle.frame_history):
+            if frame_num <= max_frame:
+                frame_data[frame_num][particle.id] = particle.areas_history[i]
+    
+    all_particle_ids = sorted(set(pid for particle in tracked_particles for pid in [particle.id]))
+    
+    with open(filename, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        
+        header = ['Frame'] + [f'Particle {pid}' for pid in all_particle_ids]
+        writer.writerow(header)
+        
+        for frame_num in range(max_frame + 1):
+            row = [frame_num]
+            for pid in all_particle_ids:
+                if pid in frame_data[frame_num]:
+                    row.append(f"{frame_data[frame_num][pid]:.2f}")
+                else:
+                    row.append('')  # Empty cell if particle wasn't present in this frame
+            writer.writerow(row)
+    
+    print(f"Particle areas saved to {filename}")
+    print(f"Total frames: {max_frame + 1}")
+    print(f"Total particles: {len(all_particle_ids)}")
+
+fig, ax = setup_plot()
+
+frame_count = 0
+
+print("Starting particle tracking with real-time area plotting...")
+print("Controls:")
+print("- 'q': Quit")
+print("- 'p': Pause/Resume")
+print("- 'r': Reset tracking")
+print("- 's': Save current plot")
+
+while True:
+    ret, frame = cap.read()
+    
+    if not ret:
+        print("End of video or failed to read frame")
+        break
+    
+    if len(frame.shape) == 3:
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else:
+        gray_frame = frame
+    
+    processed_frame, current_count, areas = process_frame(gray_frame, frame_count)
+    
+    particle_areas_history.append(areas)
+    frame_numbers.append(frame_count)
+    
+    alive_particles = sum(1 for p in tracked_particles if p.alive)
+    
+    if frame_count % plot_update_interval == 0 or frame_count < 10:
+        update_plot(ax, frame_count)
+    
+    display_height = max(processed_frame.shape[0], 200)
+    display_width = max(processed_frame.shape[1], 400) 
+    display_frame = np.zeros((display_height, display_width, 3), dtype=np.uint8)
+    
+    h, w = processed_frame.shape[:2]
+    display_frame[0:h, 0:w] = processed_frame
+    
+    y_offset = 20
+    font_scale = 0.5
+    thickness = 1
+    
+    cv2.putText(display_frame, f'Current: {current_count}', 
+                (w + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+    y_offset += 25
+    cv2.putText(display_frame, f'Unique: {total_unique_particles}', 
+                (w + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), thickness)
+    y_offset += 25
+    cv2.putText(display_frame, f'Alive: {alive_particles}', 
+                (w + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), thickness)
+    y_offset += 25
+    cv2.putText(display_frame, f'Frame: {frame_count}', 
+                (w + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+    
+    cv2.putText(display_frame, f'C:{current_count} U:{total_unique_particles} A:{alive_particles}', 
+                (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+    
+    cv2.imshow('Particle Tracking', display_frame)
+    
+    frame_count += 1
+    
+    # Press 'q' to quit, 'p' to pause, 'r' to reset tracking, 's' to save plot
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('p'):
+        cv2.waitKey(0)
+    elif key == ord('r'):
+        tracked_particles = []
+        next_particle_id = 1
+        total_unique_particles = 0
+        ax.clear()
+        print("Tracking reset!")
+    elif key == ord('s'):  # Save current plot
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = f'particle_areas_{timestamp}.png'
+        fig.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"Plot saved as {filename}")
+
+update_plot(ax, frame_count)
+
+print(f"\nFinal Statistics:")
+print(f"Total unique particles detected: {total_unique_particles}")
+print(f"Particles still alive at end: {sum(1 for p in tracked_particles if p.alive)}")
+print(f"Average particle lifetime: {np.mean([len(p.trajectory) for p in tracked_particles]):.1f} frames")
+
+
+timestamp = time.strftime("%Y%m%d_%H%M%S")
+csv_filename = f'particle_areas_{timestamp}.csv'
+save_particle_areas_to_csv(tracked_particles, csv_filename)
+
+final_filename = f'final_particle_areas_{timestamp}.png'
+fig.savefig(final_filename, dpi=300, bbox_inches='tight')
+print(f"Final plot saved as {final_filename}")
+
+input("Press Enter to close the plot and exit...")
+
+cap.release()
+cv2.destroyAllWindows()
+plt.close()
