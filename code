@@ -1,487 +1,730 @@
+"""
+Particle Tracker – Desktop GUI  (v4 – configurable video parameters)
+"""
+
+import csv
 import cv2
 import numpy as np
-from collections import deque
-import threading
 import time
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 from scipy.spatial.distance import cdist
 from matplotlib.colors import hsv_to_rgb
-import csv
+from PIL import Image, ImageTk
+import os
 
-video_path = "" # Remember to add the local video path!
-cap = cv2.VideoCapture(video_path)
+BG        = "#0d1117"
+PANEL     = "#161b22"
+BORDER    = "#21262d"
+ACCENT    = "#58a6ff"
+ACCENT2   = "#3fb950"
+WARN      = "#f0883e"
+TEXT      = "#e6edf3"
+SUBTEXT   = "#8b949e"
+FONT_MONO = ("Courier New", 10)
+FONT_UI   = ("Segoe UI", 10)
+FONT_HEAD = ("Segoe UI Semibold", 11)
 
-if not cap.isOpened():
-    raise FileNotFoundError("Video not found")
-
-particle_areas_history = []
-frame_numbers = []
-max_history_length = 100
 
 class Particle:
-    def __init__(self, id, centroid, area, bbox):
-        self.id = id
-        self.centroid = centroid
-        self.area = area
-        self.bbox = bbox
-        self.last_seen = 0
-        self.trajectory = [centroid]
-        self.areas_history = [area]
-        self.frame_history = [0] 
-        self.alive = True
-        self.color = self.generate_color()
-    
-    def generate_color(self):
+    def __init__(self, pid, centroid, area, bbox, taylor, frame_num):
+        self.id        = pid
+        self.centroid  = centroid
+        self.area      = area
+        self.bbox      = bbox
+        self.last_seen = frame_num
+        self.alive     = True
+        self.color     = self._gen_color()
+        self.trajectory       = [centroid]
+        self.frame_history    = [frame_num]
+        self.diameter_history = [self._diameter(area)]
+        self.taylor_history   = [taylor]
+        self.velocity_history = []
+        self.max_taylor             = taylor
+        self.max_taylor_frame       = frame_num
+        self.velocity_at_max_taylor = None
+        self.viscoelastic_tau       = None
+
+    @staticmethod
+    def _diameter(area):
+        return 2.0 * np.sqrt(max(area, 0) / np.pi)
+
+    def _gen_color(self):
         hue = (self.id * 137.5) % 360
-        saturation = 0.7 + (self.id % 3) * 0.1 
-        value = 0.8 + (self.id % 2) * 0.2
-        rgb = hsv_to_rgb([hue/360, saturation, value])
-        return rgb
-    
-    def update(self, centroid, area, bbox, frame_num):
-        self.centroid = centroid
-        self.area = area
-        self.bbox = bbox
+        sat = 0.7 + (self.id % 3) * 0.1
+        val = 0.8 + (self.id % 2) * 0.2
+        return hsv_to_rgb([hue / 360, sat, val])
+
+    def update(self, centroid, area, bbox, taylor, frame_num):
+        if self.trajectory:
+            dx = centroid[0] - self.trajectory[-1][0]
+            dy = centroid[1] - self.trajectory[-1][1]
+            self.velocity_history.append(np.sqrt(dx*dx + dy*dy))
+        self.centroid  = centroid
+        self.area      = area
+        self.bbox      = bbox
         self.last_seen = frame_num
         self.trajectory.append(centroid)
-        self.areas_history.append(area)
         self.frame_history.append(frame_num)
+        self.diameter_history.append(self._diameter(area))
+        self.taylor_history.append(taylor)
+        if taylor > self.max_taylor:
+            self.max_taylor       = taylor
+            self.max_taylor_frame = frame_num
         if len(self.trajectory) > 50:
             self.trajectory.pop(0)
-            self.areas_history.pop(0)
-            self.frame_history.pop(0)
 
-tracked_particles = []
-next_particle_id = 1
-total_unique_particles = 0
-max_distance_threshold = 50
-max_frames_disappeared = 10
+    def compute_viscoelastic_tau(self):
+        try:
+            idx = self.taylor_history.index(self.max_taylor)
+        except ValueError:
+            return None
+        relax = np.array(self.taylor_history[idx:])
+        if len(relax) < 4 or relax[0] <= 0:
+            return None
+        t = np.arange(len(relax), dtype=float)
+        log_r = np.log(np.clip(relax / relax[0], 1e-9, None))
+        if np.all(log_r == 0):
+            return None
+        slope, _ = np.polyfit(t, log_r, 1)
+        return (-1.0 / slope) if slope < 0 else None
 
-plot_update_interval = 5
-last_plot_update = 0
 
-def setup_plot():
-    plt.ion()  # Turn on interactive mode
-    fig, ax = plt.subplots(figsize=(12, 8))
-    ax.set_xlabel('Frame Number')
-    ax.set_ylabel('Particle Area (pixels²)')
-    ax.set_title('Real-time Particle Area Tracking')
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    return fig, ax
+class ParticleEngine:
+    def __init__(self):
+        self.reset()
 
-def update_plot(ax, current_frame):
-    ax.clear()
-    ax.set_xlabel('Frame Number')
-    ax.set_ylabel('Particle Area (pixels²)')
-    ax.set_title(f'Real-time Particle Area Tracking (Frame {current_frame})')
-    ax.grid(True, alpha=0.3)
-    
-    alive_count = 0
-    for particle in tracked_particles:
-        if particle.alive and len(particle.areas_history) > 1:
-            alive_count += 1
-            ax.plot(particle.frame_history, particle.areas_history, 
-                   color=particle.color, linewidth=2, alpha=0.8,
-                   label=f'Particle {particle.id}')
-            
-            if particle.frame_history:
-                ax.plot(particle.frame_history[-1], particle.areas_history[-1], 
-                       'o', color=particle.color, markersize=6)
-    
-    for particle in tracked_particles:
-        if not particle.alive and current_frame - particle.last_seen <= 30:
-            if len(particle.areas_history) > 1:
-                ax.plot(particle.frame_history, particle.areas_history, 
-                       color=particle.color, linewidth=1, alpha=0.3,
-                       linestyle='--', label=f'Particle {particle.id} (ended)')
-    
-    # Set axis limits
-    if tracked_particles:
-        max_frame = max([max(p.frame_history) if p.frame_history else 0 for p in tracked_particles])
-        all_areas = []
-        for p in tracked_particles:
-            all_areas.extend(p.areas_history)
-        
-        if all_areas:
-            ax.set_xlim(max(0, max_frame - 200), max_frame + 10)
-            ax.set_ylim(min(all_areas) * 0.9, max(all_areas) * 1.1)
-    
+    def reset(self):
+        self.tracked_particles      = []
+        self.next_particle_id       = 1
+        self.total_unique_particles = 0
+        self.max_distance_threshold = 50
+        self.max_frames_disappeared = 10
+        self.MIN_AREA               = 10
 
-    handles, labels = ax.get_legend_handles_labels()
-    if len(handles) <= 15:
-        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-    
-    stats_text = f'Active Particles: {alive_count}\nTotal Unique: {total_unique_particles}'
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
-            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-    
-    plt.tight_layout()
-    plt.draw()
-    plt.pause(0.001)
+    @staticmethod
+    def compute_taylor(contour):
+        if len(contour) >= 5:
+            try:
+                (_, _), (ma, mi), _ = cv2.fitEllipse(contour)
+                L, B = max(ma, mi) / 2.0, min(ma, mi) / 2.0
+                d = L + B
+                return float((L - B) / d) if d > 0 else 0.0
+            except cv2.error:
+                pass
+        (_, _), (w, h), _ = cv2.minAreaRect(contour)
+        L, B = max(w, h) / 2.0, min(w, h) / 2.0
+        d = L + B
+        return float((L - B) / d) if d > 0 else 0.0
 
-def calculate_centroid(contour):
-    M = cv2.moments(contour)
-    if M["m00"] != 0:
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-        return (cx, cy)
-    return (0, 0)
+    @staticmethod
+    def centroid(contour):
+        M = cv2.moments(contour)
+        if M["m00"] != 0:
+            return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
+        x, y, w, h = cv2.boundingRect(contour)
+        return (x + w//2, y + h//2)
 
-def track_particles(current_detections, frame_num):
-    global tracked_particles, next_particle_id, total_unique_particles
-    
-    if not current_detections:
-        for particle in tracked_particles:
-            if particle.alive and frame_num - particle.last_seen > max_frames_disappeared:
-                particle.alive = False
-        return []
-    
-    current_centroids = [det['centroid'] for det in current_detections]
-    
-    if not tracked_particles:
-        for detection in current_detections:
-            particle = Particle(
-                next_particle_id,
-                detection['centroid'],
-                detection['area'],
-                detection['bbox']
-            )
-            particle.last_seen = frame_num
-            particle.frame_history[0] = frame_num
-            tracked_particles.append(particle)
-            next_particle_id += 1
-            total_unique_particles += 1
-        return tracked_particles
-    
-    existing_centroids = []
-    alive_particles = []
-    for particle in tracked_particles:
-        if particle.alive:
-            existing_centroids.append(particle.centroid)
-            alive_particles.append(particle)
-    
-    if not existing_centroids:
-        for detection in current_detections:
-            particle = Particle(
-                next_particle_id,
-                detection['centroid'],
-                detection['area'],
-                detection['bbox']
-            )
-            particle.last_seen = frame_num
-            particle.frame_history[0] = frame_num
-            tracked_particles.append(particle)
-            next_particle_id += 1
-            total_unique_particles += 1
-        return tracked_particles
-    
-    distances = cdist(existing_centroids, current_centroids)
-    
-    matched_pairs = []
-    used_detections = set()
-    used_particles = set()
-    
-    while True:
-        min_distance = float('inf')
-        best_particle_idx = -1
-        best_detection_idx = -1
-        
-        for p_idx in range(len(alive_particles)):
-            if p_idx in used_particles:
-                continue
-            for d_idx in range(len(current_detections)):
-                if d_idx in used_detections:
+    def _match(self, detections, frame_num):
+        for p in self.tracked_particles:
+            if p.alive and frame_num - p.last_seen > self.max_frames_disappeared:
+                p.alive = False
+        if not detections:
+            return
+        det_cents   = [d['centroid'] for d in detections]
+        alive       = [p for p in self.tracked_particles if p.alive]
+        alive_cents = [p.centroid for p in alive]
+        used_p, used_d, matched = set(), set(), []
+        if alive_cents:
+            dm = cdist(alive_cents, det_cents)
+            while True:
+                tmp = dm.copy()
+                for pi in used_p: tmp[pi,:] = np.inf
+                for di in used_d: tmp[:,di] = np.inf
+                pi, di = np.unravel_index(np.argmin(tmp), tmp.shape)
+                if tmp[pi,di] >= self.max_distance_threshold:
+                    break
+                matched.append((pi,di)); used_p.add(pi); used_d.add(di)
+        for pi, di in matched:
+            d = detections[di]
+            alive[pi].update(d['centroid'],d['area'],d['bbox'],d['taylor'],frame_num)
+        for di, d in enumerate(detections):
+            if di not in used_d:
+                p = Particle(self.next_particle_id, d['centroid'], d['area'],
+                             d['bbox'], d['taylor'], frame_num)
+                self.tracked_particles.append(p)
+                self.next_particle_id       += 1
+                self.total_unique_particles += 1
+
+    def process_frame(self, image, frame_num, zoom_factor=1.0, min_area=10):
+        """
+        zoom_factor : optical magnification (e.g. 2.0 = 2x zoom).
+                      Area is divided by zoom² to keep measurements consistent.
+        min_area    : minimum particle area in scaled px² to accept as a detection.
+        """
+        self.MIN_AREA = min_area
+
+        x1, y1, x2, y2 = 262, 239, 370, 365
+        og_h, og_w = image.shape
+        scale_w = (x2 - x1) / og_w
+        scale_h = (y2 - y1) / og_h
+        area_scale = (scale_h * scale_w) / (zoom_factor ** 2)
+
+        cropped = image[y1:y2, x1:x2]
+        blurred = cv2.GaussianBlur(cropped, (7,7), 0)
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        if np.sum(thresh==255) > np.sum(thresh==0):
+            thresh = cv2.bitwise_not(thresh)
+        kernel  = np.ones((2,2), np.uint8)
+        opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+        sure_bg = cv2.dilate(opening, kernel, iterations=2)
+        dt      = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+        _, sure_fg = cv2.threshold(dt, 0.2*dt.max(), 255, 0)
+        sure_fg = np.uint8(sure_fg)
+        unknown = cv2.subtract(sure_bg, sure_fg)
+        _, markers = cv2.connectedComponents(sure_fg)
+        markers += 1; markers[unknown==255] = 0
+        color_img = cv2.cvtColor(cropped, cv2.COLOR_GRAY2BGR)
+        markers   = cv2.watershed(color_img, markers)
+        output = color_img.copy()
+        output[markers==-1] = [0,0,255]
+
+        detections = []
+        for mv in np.unique(markers):
+            if mv <= 1: continue
+            mask = np.uint8(markers==mv)
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in cnts:
+                area = cv2.contourArea(cnt) * area_scale
+                if area < self.MIN_AREA or cv2.arcLength(cnt,True) <= 0:
                     continue
-                if distances[p_idx][d_idx] < min_distance:
-                    min_distance = distances[p_idx][d_idx]
-                    best_particle_idx = p_idx
-                    best_detection_idx = d_idx
-        
-        if min_distance < max_distance_threshold and best_particle_idx != -1:
-            matched_pairs.append((best_particle_idx, best_detection_idx))
-            used_particles.add(best_particle_idx)
-            used_detections.add(best_detection_idx)
-        else:
-            break
-    
-    for p_idx, d_idx in matched_pairs:
-        particle = alive_particles[p_idx]
-        detection = current_detections[d_idx]
-        particle.update(
-            detection['centroid'],
-            detection['area'],
-            detection['bbox'],
-            frame_num
-        )
-    
-    for p_idx, particle in enumerate(alive_particles):
-        if p_idx not in used_particles:
-            if frame_num - particle.last_seen > max_frames_disappeared:
-                particle.alive = False
-    
-    for d_idx, detection in enumerate(current_detections):
-        if d_idx not in used_detections:
-            particle = Particle(
-                next_particle_id,
-                detection['centroid'],
-                detection['area'],
-                detection['bbox']
-            )
-            particle.last_seen = frame_num
-            particle.frame_history[0] = frame_num
-            tracked_particles.append(particle)
-            next_particle_id += 1
-            total_unique_particles += 1
-    
-    return tracked_particles
+                detections.append({
+                    'contour' : cnt,
+                    'area'    : area,
+                    'centroid': self.centroid(cnt),
+                    'bbox'    : cv2.boundingRect(cnt),
+                    'taylor'  : self.compute_taylor(cnt),
+                })
 
-def process_frame(image, frame_num):
-    x1, y1 = 262, 239
-    x2, y2 = 370, 365
-    ogHeight, ogWidth = image.shape
-    width, height = (x2 - x1), (y2 - y1)
-    enlargementWidth = width/ogWidth
-    enlargementHeight = height/ogHeight
-    croppedFrame = image[y1:y2, x1:x2]
-    
-    blurred = cv2.GaussianBlur(croppedFrame, (7, 7), 0)
+        self._match(detections, frame_num)
 
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    if np.sum(thresh == 255) > np.sum(thresh == 0):
-        thresh = cv2.bitwise_not(thresh)
-
-    kernel = np.ones((2, 2), np.uint8)
-    opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    sure_bg = cv2.dilate(opening, kernel, iterations=2)
-
-    dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
-    _, sure_fg = cv2.threshold(dist_transform, 0.2 * dist_transform.max(), 255, 0)
-    sure_fg = np.uint8(sure_fg)
-
-    unknown = cv2.subtract(sure_bg, sure_fg)
-
-    _, markers = cv2.connectedComponents(sure_fg)
-
-    markers = markers + 1
-
-    markers[unknown == 255] = 0
-
-    color_image = cv2.cvtColor(croppedFrame, cv2.COLOR_GRAY2BGR)
-
-    markers = cv2.watershed(color_image, markers)
-
-    output_image = color_image.copy()
-    output_image[markers == -1] = [0, 0, 255]  # red boundaries
-
-    current_detections = []
-    MIN_AREA = 10
-    
-    for marker_val in np.unique(markers):
-        if marker_val <= 1:
-            continue
-        mask = np.uint8(markers == marker_val)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            area = area * enlargementHeight * enlargementWidth
-            taylor_parameter = 0
-            (x, y), (widthRect, heightRect), angle = cv2.minAreaRect(cnt)
-
-            major_axis = max(widthRect, heightRect)
-            minor_axis = min(widthRect, heightRect)
-
-            if (major_axis + minor_axis != 0):
-                taylor_parameter = (major_axis - minor_axis) / (major_axis + minor_axis)
-
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter > 0 and area >= MIN_AREA:
-                centroid = calculate_centroid(cnt)
-                bbox = cv2.boundingRect(cnt)
-                
-                detection = {
-                    'contour': cnt,
-                    'area': area,
-                    'centroid': centroid,
-                    'bbox': bbox,
-                    'taylor parameter': taylor_parameter
-                }
-                current_detections.append(detection)
-    
-    tracked = track_particles(current_detections, frame_num)
-    
-    current_particle_count = 0
-    particle_areas = []
-    
-    for particle in tracked:
-        if particle.alive and frame_num - particle.last_seen <= 1:
-            current_particle_count += 1
-            particle_areas.append(particle.area)
-            
-            for detection in current_detections:
-                if detection['centroid'] == particle.centroid:
-                    cv2.drawContours(output_image, [detection['contour']], -1, (0, 255, 0), 2)
-                    
-                    x, y = particle.centroid
-                    cv2.putText(output_image, f'ID:{particle.id}', 
-                              (x-20, y-15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-                    cv2.putText(output_image, f'{int(particle.area)}', 
-                              (x-20, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-                    
-                    if len(particle.trajectory) > 1:
-                        pts = np.array(particle.trajectory, np.int32)
-                        cv2.polylines(output_image, [pts], False, (255, 0, 255), 1)
-                    
-                    cv2.circle(output_image, particle.centroid, 3, (0, 255, 255), -1)
+        frame_diams, frame_taylors, active = [], [], 0
+        for p in self.tracked_particles:
+            if not p.alive or frame_num - p.last_seen > 1:
+                continue
+            active += 1
+            frame_diams.append(p.diameter_history[-1])
+            frame_taylors.append(p.taylor_history[-1])
+            for det in detections:
+                if det['centroid'] == p.centroid:
+                    cv2.drawContours(output, [det['contour']], -1, (0,255,0), 2)
+                    x, y = p.centroid
+                    cv2.putText(output, f'ID:{p.id}',      (x-20,y-22), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,255,0), 1)
+                    cv2.putText(output, f'd={p.diameter_history[-1]:.1f}', (x-20,y-12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,255,255), 1)
+                    cv2.putText(output, f'T={p.taylor_history[-1]:.3f}',   (x-20,y-2),  cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,128,0), 1)
+                    if len(p.trajectory) > 1:
+                        pts = np.array(p.trajectory, np.int32)
+                        cv2.polylines(output, [pts], False, tuple(int(c*255) for c in p.color), 1)
+                    cv2.circle(output, p.centroid, 3, (0,255,255), -1)
                     break
 
-    return output_image, current_particle_count, particle_areas
-
-def save_particle_areas_to_csv(tracked_particles, filename):
-    if not tracked_particles:
-        print("No particles to save!")
-        return
-    
-    # Find the maximum frame number
-    max_frame = 0
-    for particle in tracked_particles:
-        if particle.frame_history:
-            max_frame = max(max_frame, max(particle.frame_history))
-    
-    # Structure of duictionary: {frame_num: {particle_id: area}}
-    frame_data = {}
-    for frame_num in range(max_frame + 1):
-        frame_data[frame_num] = {}
-    
-    for particle in tracked_particles:
-        for i, frame_num in enumerate(particle.frame_history):
-            if frame_num <= max_frame:
-                frame_data[frame_num][particle.id] = particle.areas_history[i]
-    
-    all_particle_ids = sorted(set(pid for particle in tracked_particles for pid in [particle.id]))
-    
-    with open(filename, 'w', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        
-        header = ['Frame'] + [f'Particle {pid}' for pid in all_particle_ids]
-        writer.writerow(header)
-        
-        for frame_num in range(max_frame + 1):
-            row = [frame_num]
-            for pid in all_particle_ids:
-                if pid in frame_data[frame_num]:
-                    row.append(f"{frame_data[frame_num][pid]:.2f}")
-                else:
-                    row.append('')  # Empty cell if particle wasn't present in this frame
-            writer.writerow(row)
-    
-    print(f"Particle areas saved to {filename}")
-    print(f"Total frames: {max_frame + 1}")
-    print(f"Total particles: {len(all_particle_ids)}")
-
-fig, ax = setup_plot()
-
-frame_count = 0
-
-print("Starting particle tracking with real-time area plotting...")
-print("Controls:")
-print("- 'q': Quit")
-print("- 'p': Pause/Resume")
-print("- 'r': Reset tracking")
-print("- 's': Save current plot")
-
-while True:
-    ret, frame = cap.read()
-    
-    if not ret:
-        print("End of video or failed to read frame")
-        break
-    
-    if len(frame.shape) == 3:
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    else:
-        gray_frame = frame
-    
-    processed_frame, current_count, areas = process_frame(gray_frame, frame_count)
-    
-    particle_areas_history.append(areas)
-    frame_numbers.append(frame_count)
-    
-    alive_particles = sum(1 for p in tracked_particles if p.alive)
-    
-    if frame_count % plot_update_interval == 0 or frame_count < 10:
-        update_plot(ax, frame_count)
-    
-    display_height = max(processed_frame.shape[0], 200)
-    display_width = max(processed_frame.shape[1], 400) 
-    display_frame = np.zeros((display_height, display_width, 3), dtype=np.uint8)
-    
-    h, w = processed_frame.shape[:2]
-    display_frame[0:h, 0:w] = processed_frame
-    
-    y_offset = 20
-    font_scale = 0.5
-    thickness = 1
-    
-    cv2.putText(display_frame, f'Current: {current_count}', 
-                (w + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
-    y_offset += 25
-    cv2.putText(display_frame, f'Unique: {total_unique_particles}', 
-                (w + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), thickness)
-    y_offset += 25
-    cv2.putText(display_frame, f'Alive: {alive_particles}', 
-                (w + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), thickness)
-    y_offset += 25
-    cv2.putText(display_frame, f'Frame: {frame_count}', 
-                (w + 10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
-    
-    cv2.putText(display_frame, f'C:{current_count} U:{total_unique_particles} A:{alive_particles}', 
-                (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-    
-    cv2.imshow('Particle Tracking', display_frame)
-    
-    frame_count += 1
-    
-    # Press 'q' to quit, 'p' to pause, 'r' to reset tracking, 's' to save plot
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
-        break
-    elif key == ord('p'):
-        cv2.waitKey(0)
-    elif key == ord('r'):
-        tracked_particles = []
-        next_particle_id = 1
-        total_unique_particles = 0
-        ax.clear()
-        print("Tracking reset!")
-    elif key == ord('s'):  # Save current plot
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = f'particle_areas_{timestamp}.png'
-        fig.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"Plot saved as {filename}")
-
-update_plot(ax, frame_count)
-
-print(f"\nFinal Statistics:")
-print(f"Total unique particles detected: {total_unique_particles}")
-print(f"Particles still alive at end: {sum(1 for p in tracked_particles if p.alive)}")
-print(f"Average particle lifetime: {np.mean([len(p.trajectory) for p in tracked_particles]):.1f} frames")
+        return output, active, frame_diams, frame_taylors
 
 
-timestamp = time.strftime("%Y%m%d_%H%M%S")
-csv_filename = f'particle_areas_{timestamp}.csv'
-save_particle_areas_to_csv(tracked_particles, csv_filename)
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Particle Tracker")
+        self.configure(bg=BG)
+        self.resizable(True, True)
+        self.geometry("1280x920")
 
-final_filename = f'final_particle_areas_{timestamp}.png'
-fig.savefig(final_filename, dpi=300, bbox_inches='tight')
-print(f"Final plot saved as {final_filename}")
+        self.video_path   = None
+        self.cap          = None
+        self.engine       = ParticleEngine()
+        self.fps          = 30.0
+        self._zoom_factor = 1.0
+        self._min_area    = 10.0
+        self.frame_count  = 0
+        self.running      = False
+        self.paused       = False
+        self._thread      = None
+        self._stop_event  = threading.Event()
+        self.total_frames = 0
+        self.output_dir   = os.path.expanduser("~")
 
-input("Press Enter to close the plot and exit...")
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-cap.release()
-cv2.destroyAllWindows()
-plt.close()
+    def _build_ui(self):
+        # ── top bar ───────────────────────────────────────────────────────────
+        top = tk.Frame(self, bg=PANEL, pady=10, padx=16)
+        top.pack(fill=tk.X)
+        tk.Label(top, text="⬡  PARTICLE TRACKER", bg=PANEL, fg=ACCENT,
+                 font=("Segoe UI Semibold", 14)).pack(side=tk.LEFT)
+        btn_frame = tk.Frame(top, bg=PANEL)
+        btn_frame.pack(side=tk.RIGHT)
+        self._btn = {}
+        defs = [
+            ("Browse Video",  ACCENT,    self._browse,  "browse"),
+            ("▶  Start",      ACCENT2,   self._start,   "start"),
+            ("⏸  Pause",      WARN,      self._pause,   "pause"),
+            ("⏹  Stop",       "#da3633", self._stop,    "stop"),
+            ("Export CSV",    "#bc8cff", self._export,  "export"),
+        ]
+        for label, color, cmd, key in defs:
+            b = tk.Button(btn_frame, text=label, bg=BORDER, fg=color,
+                          font=FONT_HEAD, relief=tk.FLAT, padx=12, pady=6,
+                          activebackground=BORDER, activeforeground=TEXT,
+                          cursor="hand2", command=cmd)
+            b.pack(side=tk.LEFT, padx=4)
+            self._btn[key] = b
+        self._btn["pause"].config(state=tk.DISABLED)
+        self._btn["stop"].config(state=tk.DISABLED)
+        self._btn["export"].config(state=tk.DISABLED)
+        self._btn["start"].config(state=tk.DISABLED)
+
+        # ── VIDEO PARAMETERS panel ────────────────────────────────────────────
+        params_outer = tk.Frame(self, bg=PANEL, pady=10, padx=16)
+        params_outer.pack(fill=tk.X)
+
+        header_row = tk.Frame(params_outer, bg=PANEL)
+        header_row.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(header_row, text="VIDEO PARAMETERS", bg=PANEL, fg=SUBTEXT,
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
+        tk.Label(header_row,
+                 text="  Set before starting  •  fps is auto-filled from the video file",
+                 bg=PANEL, fg=SUBTEXT, font=("Segoe UI", 8)).pack(side=tk.LEFT)
+
+        fields_row = tk.Frame(params_outer, bg=PANEL)
+        fields_row.pack(fill=tk.X)
+
+        def make_field(parent, label, tooltip, default, col):
+            cell = tk.Frame(parent, bg=PANEL)
+            cell.grid(row=0, column=col, padx=(0, 30), sticky=tk.W)
+            tk.Label(cell, text=label, bg=PANEL, fg=TEXT,
+                     font=FONT_HEAD).pack(anchor=tk.W)
+            tk.Label(cell, text=tooltip, bg=PANEL, fg=SUBTEXT,
+                     font=("Segoe UI", 8)).pack(anchor=tk.W)
+            var = tk.StringVar(value=str(default))
+            ent = tk.Entry(cell, textvariable=var, bg=BORDER, fg=TEXT,
+                           insertbackground=TEXT, relief=tk.FLAT,
+                           font=FONT_MONO, width=12,
+                           highlightthickness=1,
+                           highlightbackground=BORDER,
+                           highlightcolor=ACCENT)
+            ent.pack(anchor=tk.W, pady=(3, 0))
+            return var
+
+        self._fps_var     = make_field(fields_row,
+                                       "Frame Rate (fps)",
+                                       "e.g. 25, 30, 60  — auto-detected on load",
+                                       "30.00", col=0)
+        self._zoom_var    = make_field(fields_row,
+                                       "Zoom Factor",
+                                       "Optical magnification  (1.0 = no zoom)",
+                                       "1.0", col=1)
+        self._minarea_var = make_field(fields_row,
+                                       "Min Particle Area (px²)",
+                                       "Smallest blob to count as a particle",
+                                       "10", col=2)
+
+        apply_col = tk.Frame(fields_row, bg=PANEL)
+        apply_col.grid(row=0, column=3, sticky=tk.S, padx=(0, 10))
+        tk.Button(apply_col, text="✓  Apply",
+                  bg=BORDER, fg=ACCENT2,
+                  font=FONT_HEAD, relief=tk.FLAT,
+                  padx=10, pady=6,
+                  activebackground=BORDER, activeforeground=TEXT,
+                  cursor="hand2", command=self._apply_params).pack()
+
+        self._param_status = tk.Label(fields_row, text="", bg=PANEL,
+                                      fg=ACCENT2, font=("Segoe UI", 9))
+        self._param_status.grid(row=0, column=4, sticky=tk.W)
+
+        # ── progress bar ──────────────────────────────────────────────────────
+        prog_frame = tk.Frame(self, bg=BG, pady=4, padx=16)
+        prog_frame.pack(fill=tk.X)
+        self.progress = ttk.Progressbar(prog_frame, orient=tk.HORIZONTAL,
+                                        mode='determinate', length=400)
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("TProgressbar", troughcolor=BORDER,
+                        background=ACCENT, thickness=6)
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.lbl_progress = tk.Label(prog_frame, text="No video loaded",
+                                     bg=BG, fg=SUBTEXT, font=FONT_UI)
+        self.lbl_progress.pack(side=tk.LEFT, padx=10)
+
+        # ── main body ─────────────────────────────────────────────────────────
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        left = tk.Frame(body, bg=PANEL, bd=0)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+        tk.Label(left, text="LIVE PREVIEW", bg=PANEL, fg=SUBTEXT,
+                 font=("Segoe UI", 9)).pack(anchor=tk.W, padx=8, pady=(6, 2))
+        self.canvas_video = tk.Label(left, bg="#000000", width=500, height=380)
+        self.canvas_video.pack(padx=8, pady=(0, 8), fill=tk.BOTH, expand=True)
+
+        right = tk.Frame(body, bg=BG, width=520)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        right.pack_propagate(False)
+
+        stats_frame = tk.Frame(right, bg=BG)
+        stats_frame.pack(fill=tk.X, pady=(0, 6))
+        self._stat_vars = {}
+        stat_defs = [
+            ("sample_n",    "Sample N",    "0",  ACCENT),
+            ("active",      "Active",      "0",  ACCENT2),
+            ("mean_diam",   "Mean Diam",   "—",  "#e3b341"),
+            ("mean_taylor", "Mean Taylor", "—",  WARN),
+            ("frame",       "Frame",       "0",  SUBTEXT),
+        ]
+        for i, (key, label, init, color) in enumerate(stat_defs):
+            card = tk.Frame(stats_frame, bg=PANEL, padx=10, pady=8)
+            card.grid(row=0, column=i, padx=3, sticky=tk.EW)
+            stats_frame.columnconfigure(i, weight=1)
+            tk.Label(card, text=label, bg=PANEL, fg=SUBTEXT,
+                     font=("Segoe UI", 8)).pack()
+            var = tk.StringVar(value=init)
+            self._stat_vars[key] = var
+            tk.Label(card, textvariable=var, bg=PANEL, fg=color,
+                     font=("Segoe UI Semibold", 14)).pack()
+
+        self.fig = Figure(figsize=(5.8, 5.0), facecolor=PANEL, tight_layout=True)
+        self.fig.patch.set_facecolor(PANEL)
+        self._axes = self.fig.subplots(2, 2)
+        for ax in self._axes.flat:
+            ax.set_facecolor(BG)
+            ax.tick_params(colors=SUBTEXT, labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(BORDER)
+            ax.grid(True, color=BORDER, linewidth=0.5)
+        self._axes[0,0].set_title("Diameter / particle (px)", color=TEXT, fontsize=8)
+        self._axes[0,1].set_title("Taylor parameter / particle", color=TEXT, fontsize=8)
+        self._axes[1,0].set_title("Velocity before max Taylor (px/s)", color=TEXT, fontsize=8)
+        self._axes[1,1].set_title("Taylor relaxation  τ", color=TEXT, fontsize=8)
+
+        self.canvas_plot = FigureCanvasTkAgg(self.fig, master=right)
+        self.canvas_plot.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # ── log console ───────────────────────────────────────────────────────
+        log_frame = tk.Frame(self, bg=PANEL, height=90)
+        log_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=8, pady=(0, 8))
+        log_frame.pack_propagate(False)
+        tk.Label(log_frame, text="LOG", bg=PANEL, fg=SUBTEXT,
+                 font=("Segoe UI", 8)).pack(anchor=tk.W, padx=8, pady=(4, 0))
+        self.log_box = tk.Text(log_frame, bg=PANEL, fg=SUBTEXT, font=FONT_MONO,
+                               state=tk.DISABLED, relief=tk.FLAT,
+                               wrap=tk.WORD, height=4)
+        self.log_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+
+    # ── parameter helpers ─────────────────────────────────────────────────────
+    def _parse_params(self):
+        fps = float(self._fps_var.get())
+        if fps <= 0: raise ValueError("Frame rate must be > 0")
+        zoom = float(self._zoom_var.get())
+        if zoom <= 0: raise ValueError("Zoom factor must be > 0")
+        min_area = float(self._minarea_var.get())
+        if min_area < 0: raise ValueError("Min area must be >= 0")
+        return fps, zoom, min_area
+
+    def _apply_params(self):
+        try:
+            fps, zoom, min_area = self._parse_params()
+        except (ValueError, TypeError) as e:
+            messagebox.showerror("Parameter error", str(e))
+            return
+        self.fps             = fps
+        self._zoom_factor    = zoom
+        self._min_area       = min_area
+        self.engine.MIN_AREA = min_area
+        self._param_status.config(
+            text=f"✓  fps={fps}  |  zoom={zoom}×  |  min area={min_area} px²",
+            fg=ACCENT2)
+        self._log(f"Params applied → fps={fps}  zoom={zoom}×  min_area={min_area}px²")
+
+    # ── logging ───────────────────────────────────────────────────────────────
+    def _log(self, msg):
+        self.log_box.configure(state=tk.NORMAL)
+        self.log_box.insert(tk.END, f"[{time.strftime('%H:%M:%S')}]  {msg}\n")
+        self.log_box.see(tk.END)
+        self.log_box.configure(state=tk.DISABLED)
+
+    # ── file browse ───────────────────────────────────────────────────────────
+    def _browse(self):
+        path = filedialog.askopenfilename(
+            title="Select video file",
+            filetypes=[("Video files", "*.avi *.mp4 *.mov *.mkv *.wmv"),
+                       ("All files", "*.*")]
+        )
+        if not path:
+            return
+        self.video_path = path
+        self.output_dir = os.path.dirname(path)
+        self._log(f"Loaded: {os.path.basename(path)}")
+        self._btn["start"].config(state=tk.NORMAL)
+        self.lbl_progress.config(text=os.path.basename(path))
+        tmp = cv2.VideoCapture(path)
+        self.total_frames = int(tmp.get(cv2.CAP_PROP_FRAME_COUNT))
+        detected_fps = tmp.get(cv2.CAP_PROP_FPS)
+        tmp.release()
+        if detected_fps > 0:
+            self.fps = detected_fps
+            self._fps_var.set(f"{detected_fps:.2f}")
+            self._log(f"  Auto-detected fps={detected_fps:.2f}  |  {self.total_frames} frames")
+        else:
+            self._log(f"  fps not detected – using {self.fps:.1f}")
+        self.progress["maximum"] = max(self.total_frames, 1)
+        self._param_status.config(text="")
+
+    # ── start / pause / stop ──────────────────────────────────────────────────
+    def _start(self):
+        if self.running:
+            return
+        try:
+            fps, zoom, min_area = self._parse_params()
+        except (ValueError, TypeError) as e:
+            messagebox.showerror("Parameter error", str(e))
+            return
+        self.fps          = fps
+        self._zoom_factor = zoom
+        self._min_area    = min_area
+
+        self.engine.reset()
+        self.frame_count = 0
+        self.cap = cv2.VideoCapture(self.video_path)
+        if not self.cap.isOpened():
+            messagebox.showerror("Error", "Cannot open video file.")
+            return
+        self.running = True
+        self.paused  = False
+        self._stop_event.clear()
+        self._btn["start"].config(state=tk.DISABLED)
+        self._btn["pause"].config(state=tk.NORMAL)
+        self._btn["stop"].config(state=tk.NORMAL)
+        self._btn["export"].config(state=tk.DISABLED)
+        self._log(f"Tracking started → fps={fps}  zoom={zoom}×  min_area={min_area}px²")
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def _pause(self):
+        if not self.running:
+            return
+        self.paused = not self.paused
+        self._btn["pause"].config(text="▶  Resume" if self.paused else "⏸  Pause")
+        self._log("Paused." if self.paused else "Resumed.")
+
+    def _stop(self):
+        self._stop_event.set()
+        self.running = False
+        self.paused  = False
+        self._btn["pause"].config(text="⏸  Pause", state=tk.DISABLED)
+        self._btn["stop"].config(state=tk.DISABLED)
+        self._btn["start"].config(state=tk.NORMAL)
+        self._btn["export"].config(state=tk.NORMAL)
+        self._log("Stopped.")
+
+    # ── tracking loop ─────────────────────────────────────────────────────────
+    def _run_loop(self):
+        plot_interval = 5
+        while not self._stop_event.is_set():
+            if self.paused:
+                time.sleep(0.05)
+                continue
+            ret, frame = self.cap.read()
+            if not ret:
+                self.after(0, self._on_video_end)
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape)==3 else frame
+            processed, active, f_diams, f_taylors = self.engine.process_frame(
+                gray, self.frame_count,
+                zoom_factor=self._zoom_factor,
+                min_area=self._min_area
+            )
+            snapshot = (processed.copy(), active, f_diams[:], f_taylors[:],
+                        self.frame_count, self.engine.total_unique_particles)
+            self.after(0, self._update_gui, snapshot)
+            if self.frame_count % plot_interval == 0:
+                self.after(0, self._update_plots)
+            self.frame_count += 1
+        if self.cap:
+            self.cap.release()
+
+    def _on_video_end(self):
+        self._log(f"Video complete. {self.engine.total_unique_particles} unique particles.")
+        self._stop()
+        self._update_plots()
+
+    def _update_gui(self, snapshot):
+        processed, active, f_diams, f_taylors, fc, unique = snapshot
+        rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
+        cw = self.canvas_video.winfo_width()  or 500
+        ch = self.canvas_video.winfo_height() or 380
+        h, w = rgb.shape[:2]
+        scale = min(cw/w, ch/h)
+        nw, nh = max(1, int(w*scale)), max(1, int(h*scale))
+        rgb = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        img = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.canvas_video.configure(image=img)
+        self.canvas_video.image = img
+        md = f"{np.mean(f_diams):.1f} px" if f_diams else "—"
+        mt = f"{np.mean(f_taylors):.4f}"  if f_taylors else "—"
+        self._stat_vars["sample_n"].set(str(unique))
+        self._stat_vars["active"].set(str(active))
+        self._stat_vars["mean_diam"].set(md)
+        self._stat_vars["mean_taylor"].set(mt)
+        self._stat_vars["frame"].set(str(fc))
+        self.progress["value"] = fc
+
+    def _update_plots(self):
+        particles = self.engine.tracked_particles
+        fps       = self.fps
+        axes      = self._axes
+        for ax in axes.flat:
+            ax.clear()
+            ax.set_facecolor(BG)
+            ax.tick_params(colors=SUBTEXT, labelsize=7)
+            for sp in ax.spines.values():
+                sp.set_edgecolor(BORDER)
+            ax.grid(True, color=BORDER, linewidth=0.5)
+
+        axes[0,0].set_title("Diameter / particle (px)", color=TEXT, fontsize=8)
+        axes[0,0].set_xlabel("Frame", color=SUBTEXT, fontsize=7)
+        axes[0,0].set_ylabel("px", color=SUBTEXT, fontsize=7)
+        for p in particles:
+            if len(p.diameter_history) > 1:
+                axes[0,0].plot(p.frame_history, p.diameter_history,
+                               color=p.color, alpha=0.9 if p.alive else 0.3, linewidth=1.2)
+
+        axes[0,1].set_title("Taylor parameter / particle", color=TEXT, fontsize=8)
+        axes[0,1].set_xlabel("Frame", color=SUBTEXT, fontsize=7)
+        axes[0,1].set_ylabel("D", color=SUBTEXT, fontsize=7)
+        axes[0,1].set_ylim(-0.05, 1.05)
+        for p in particles:
+            if len(p.taylor_history) > 1:
+                a = 0.9 if p.alive else 0.3
+                axes[0,1].plot(p.frame_history, p.taylor_history,
+                               color=p.color, alpha=a, linewidth=1.2)
+                axes[0,1].plot(p.max_taylor_frame, p.max_taylor,
+                               '*', color=p.color, markersize=7)
+
+        axes[1,0].set_title("Velocity before max Taylor (px/s)", color=TEXT, fontsize=8)
+        axes[1,0].set_xlabel("Particle ID", color=SUBTEXT, fontsize=7)
+        axes[1,0].set_ylabel("px/s", color=SUBTEXT, fontsize=7)
+        ids, vels, cols = [], [], []
+        for p in particles:
+            try:
+                peak_idx = p.taylor_history.index(p.max_taylor)
+            except ValueError:
+                continue
+            if peak_idx > 0 and (peak_idx-1) < len(p.velocity_history):
+                ids.append(p.id)
+                vels.append(p.velocity_history[peak_idx-1] * fps)
+                cols.append(p.color)
+        if ids:
+            axes[1,0].bar(ids, vels, color=cols, alpha=0.85)
+
+        axes[1,1].set_title("Taylor relaxation  τ", color=TEXT, fontsize=8)
+        axes[1,1].set_xlabel("Frames after peak", color=SUBTEXT, fontsize=7)
+        axes[1,1].set_ylabel("D (norm)", color=SUBTEXT, fontsize=7)
+        axes[1,1].set_ylim(-0.05, 1.1)
+        for p in particles:
+            tau = p.compute_viscoelastic_tau()
+            if tau is None: continue
+            try:
+                idx = p.taylor_history.index(p.max_taylor)
+            except ValueError:
+                continue
+            relax = np.array(p.taylor_history[idx:])
+            if len(relax) < 4 or relax[0] <= 0: continue
+            norm = relax / relax[0]
+            t_ax = np.arange(len(relax))
+            axes[1,1].plot(t_ax, norm, color=p.color, alpha=0.85, linewidth=1.2,
+                           label=f'P{p.id} τ={tau:.1f}f')
+            t_fit = np.linspace(0, len(relax)-1, 80)
+            axes[1,1].plot(t_fit, np.exp(-t_fit/tau), '--', color=p.color, alpha=0.4)
+        hdl, lbl = axes[1,1].get_legend_handles_labels()
+        if hdl:
+            axes[1,1].legend(fontsize=6, loc='upper right',
+                             facecolor=PANEL, labelcolor=TEXT)
+        self.fig.tight_layout(pad=1.2)
+        self.canvas_plot.draw_idle()
+
+    def _export(self):
+        if not self.engine.tracked_particles:
+            messagebox.showinfo("Export", "No tracking data to export.")
+            return
+        ts   = time.strftime('%Y%m%d_%H%M%S')
+        fps  = self.fps
+        zoom = self._zoom_factor
+        mina = self._min_area
+        particles = self.engine.tracked_particles
+
+        ts_path = os.path.join(self.output_dir, f'particle_timeseries_{ts}.csv')
+        with open(ts_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['# capture_fps', fps, 'zoom_factor', zoom, 'min_area_px2', mina])
+            w.writerow(['particle_id','frame','diameter_px','taylor_parameter',
+                        'velocity_px_per_s','frames_after_max_taylor'])
+            for p in particles:
+                vel_s = [v*fps for v in p.velocity_history]
+                for i in range(len(p.frame_history)):
+                    vel = f'{vel_s[i-1]:.4f}' if i>0 and (i-1)<len(vel_s) else ''
+                    w.writerow([p.id, p.frame_history[i],
+                                f'{p.diameter_history[i]:.4f}',
+                                f'{p.taylor_history[i]:.6f}',
+                                vel,
+                                p.frame_history[i]-p.max_taylor_frame])
+
+        sum_path = os.path.join(self.output_dir, f'particle_summary_{ts}.csv')
+        with open(sum_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['# capture_fps', fps, 'zoom_factor', zoom, 'min_area_px2', mina])
+            w.writerow(['particle_id','total_frames_tracked',
+                        'mean_diameter_px','std_diameter_px',
+                        'min_diameter_px','max_diameter_px',
+                        'max_taylor_parameter','frame_of_max_taylor',
+                        'velocity_before_max_taylor_px_per_s',
+                        'viscoelastic_tau_frames','viscoelastic_tau_seconds'])
+            for p in particles:
+                try:
+                    peak_idx = p.taylor_history.index(p.max_taylor)
+                except ValueError:
+                    peak_idx = 0
+                vel_b = ''
+                if peak_idx > 0 and (peak_idx-1) < len(p.velocity_history):
+                    vel_b = f'{p.velocity_history[peak_idx-1]*fps:.4f}'
+                tau_fr = p.compute_viscoelastic_tau()
+                tau_s  = (tau_fr/fps) if tau_fr else ''
+                d = p.diameter_history
+                w.writerow([p.id, len(p.frame_history),
+                            f'{np.mean(d):.4f}', f'{np.std(d):.4f}',
+                            f'{np.min(d):.4f}',  f'{np.max(d):.4f}',
+                            f'{p.max_taylor:.6f}', p.max_taylor_frame,
+                            vel_b,
+                            f'{tau_fr:.4f}' if tau_fr else '',
+                            f'{tau_s:.6f}'  if tau_s != '' else ''])
+
+        self._log(f"Exported → {os.path.basename(ts_path)}")
+        self._log(f"Exported → {os.path.basename(sum_path)}")
+        messagebox.showinfo("Export complete",
+                            f"Saved to:\n{ts_path}\n{sum_path}")
+
+    def _on_close(self):
+        self._stop_event.set()
+        self.running = False
+        if self.cap:
+            self.cap.release()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
