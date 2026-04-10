@@ -1,0 +1,1100 @@
+"""
+CSV Downloadables:
+particle_timeseries_*.csv — every frame, every particle: vdiam_px/um, major/minor, Taylor, velocity, dD/dt
+particle_peak_analysis_*.csv — one row per particle: T before/at/after, ΔT, V before/after, velocity delta, vdiam stats, τ
+particle_size_distribution_*.csv — mean/std of vdiam, major, minor, Taylor per particle
+
+User Note: The table has multiple columns, extend the horizontal scroll bar to see them all.  The "T before/at/after" columns show the Taylor parameter 1 frame before, at, and 1 frame after the confirmed peak frame.  ΔT is the difference between after and before (signed).  V before/after are the velocities in µm/s one frame before and after the peak frame.  Velocity delta is the difference between after and before (signed).  The vdiam stats column shows the mean and std of vertical diameter across all frames for that particle.  τ is the viscoelastic relaxation time computed from post-peak Taylor decay, if available.
+"""
+
+import csv
+import cv2
+import numpy as np
+import time
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from scipy.spatial.distance import cdist
+from matplotlib.colors import hsv_to_rgb
+from PIL import Image, ImageTk
+import os
+
+# ── colour palette ─────────────────────────────────────────────────────────────
+BG        = "#0d1117"
+PANEL     = "#161b22"
+BORDER    = "#21262d"
+ACCENT    = "#58a6ff"
+ACCENT2   = "#3fb950"
+WARN      = "#f0883e"
+TEXT      = "#e6edf3"
+SUBTEXT   = "#8b949e"
+FONT_MONO = ("Courier New", 10)
+FONT_UI   = ("Segoe UI", 10)
+FONT_HEAD = ("Segoe UI Semibold", 11)
+
+# ── tunables ───────────────────────────────────────────────────────────────────
+PEAK_CONFIRM_FRAMES = 3   # consecutive declining frames to confirm a peak
+DERIV_WINDOW        = 4   # rolling window for dD/dt finite difference
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+def vertical_diameter_px(contour):
+    """
+    Return the diameter of a particle measured along the Y axis (vertical span).
+
+    For oddly-shaped blobs this is more physically meaningful than the major
+    axis of an ellipse fit, because microfluidic deformation is typically
+    observed as elongation along the flow direction (horizontal).  The vertical
+    extent therefore gives the true cross-sectional diameter independent of
+    shape eccentricity.
+
+    Falls back to minAreaRect minor axis if the contour has fewer than 2 points.
+    """
+    if contour is None or len(contour) < 2:
+        # Fallback
+        (_, _), (w, h), _ = cv2.minAreaRect(contour) if contour is not None and len(contour) >= 4 else ((0,0),(1,1),0)
+        return float(min(w, h))
+    pts = contour.reshape(-1, 2)
+    return float(pts[:, 1].max() - pts[:, 1].min())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+class Particle:
+    def __init__(self, pid, centroid, area, bbox, taylor,
+                 major_px, minor_px, vdiam_px, frame_num):
+        self.id        = pid
+        self.centroid  = centroid
+        self.area      = area
+        self.bbox      = bbox
+        self.last_seen = frame_num
+        self.alive     = True
+        self.color     = self._gen_color()
+
+        self.trajectory    = [centroid]
+        self.frame_history = [frame_num]
+
+        self.major_history  = [major_px]   # ellipse major axis (px)
+        self.minor_history  = [minor_px]   # ellipse minor axis (px)
+        self.vdiam_history  = [vdiam_px]   # vertical diameter (px)  ← primary
+
+        self.taylor_history   = [taylor]
+        self.velocity_history = []          # px / frame (crop pixels)
+
+        # ── peak / derivative tracking ────────────────────────────────────────
+        self.taylor_derivative_history = [np.nan]
+
+        self.peak_confirmed       = False
+        self.peak_confirmed_frame = None
+
+        self._candidate_peak_value = taylor
+        self._candidate_peak_idx   = 0
+        self._frames_declining      = 0
+
+        self.max_taylor             = taylor
+        self.max_taylor_frame       = frame_num
+        self.velocity_at_max_taylor = None   # set after peak frame is finalised
+        self.viscoelastic_tau       = None
+
+        # ── delta-Taylor & velocity around peak (filled once peak confirmed) ──
+        self.taylor_before_peak  = None   # Taylor value 1 frame before peak
+        self.taylor_after_peak   = None   # Taylor value 1 frame after peak
+        self.delta_taylor        = None   # after − before  (signed)
+        self.velocity_before_peak = None  # µm/s one frame before peak frame
+        self.velocity_after_peak  = None  # µm/s one frame after peak frame
+
+    def _gen_color(self):
+        hue = (self.id * 137.5) % 360
+        sat = 0.7 + (self.id % 3) * 0.1
+        val = 0.8 + (self.id % 2) * 0.2
+        return hsv_to_rgb([hue / 360, sat, val])
+
+    def _update_peak_detection(self, taylor, frame_num):
+        if self.peak_confirmed:
+            return
+        if taylor > self._candidate_peak_value:
+            self._candidate_peak_value = taylor
+            self._candidate_peak_idx   = len(self.taylor_history)
+            self._frames_declining     = 0
+        elif taylor < self._candidate_peak_value:
+            self._frames_declining += 1
+            if self._frames_declining >= PEAK_CONFIRM_FRAMES:
+                self.peak_confirmed       = True
+                self.peak_confirmed_frame = frame_num
+                self._finalise_peak_stats()
+
+    def _finalise_peak_stats(self):
+        """Compute Δtaylor and velocities around the confirmed peak."""
+        try:
+            peak_list_idx = self.taylor_history.index(self.max_taylor)
+        except ValueError:
+            return
+
+        # Taylor values immediately before / after peak
+        if peak_list_idx > 0:
+            self.taylor_before_peak = self.taylor_history[peak_list_idx - 1]
+        if peak_list_idx + 1 < len(self.taylor_history):
+            self.taylor_after_peak = self.taylor_history[peak_list_idx + 1]
+
+        if (self.taylor_before_peak is not None and
+                self.taylor_after_peak is not None):
+            self.delta_taylor = self.taylor_after_peak - self.taylor_before_peak
+
+        # velocity_history has one fewer entry than frame_history
+        # velocity_history[i] = speed between frame_history[i] and frame_history[i+1]
+        # So velocity BEFORE peak frame = velocity_history[peak_list_idx - 1]
+        # velocity AFTER peak frame    = velocity_history[peak_list_idx]
+        if peak_list_idx > 0 and (peak_list_idx - 1) < len(self.velocity_history):
+            self.velocity_before_peak = self.velocity_history[peak_list_idx - 1]
+        if peak_list_idx < len(self.velocity_history):
+            self.velocity_after_peak = self.velocity_history[peak_list_idx]
+
+    def _compute_derivative(self):
+        if not self.peak_confirmed:
+            return np.nan
+        try:
+            peak_confirmed_list_idx = self.frame_history.index(
+                self.peak_confirmed_frame)
+        except ValueError:
+            return np.nan
+        post = self.taylor_history[peak_confirmed_list_idx:]
+        if len(post) < DERIV_WINDOW:
+            return np.nan
+        window_slice = post[-(DERIV_WINDOW):]
+        return float((window_slice[-1] - window_slice[0]) / (DERIV_WINDOW - 1))
+
+    def update(self, centroid, area, bbox, taylor,
+               major_px, minor_px, vdiam_px, frame_num):
+        if self.trajectory:
+            dx = centroid[0] - self.trajectory[-1][0]
+            dy = centroid[1] - self.trajectory[-1][1]
+            self.velocity_history.append(float(np.sqrt(dx*dx + dy*dy)))
+
+        self._update_peak_detection(taylor, frame_num)
+
+        self.centroid  = centroid
+        self.area      = area
+        self.bbox      = bbox
+        self.last_seen = frame_num
+        self.trajectory.append(centroid)
+        self.frame_history.append(frame_num)
+        self.major_history.append(major_px)
+        self.minor_history.append(minor_px)
+        self.vdiam_history.append(vdiam_px)
+        self.taylor_history.append(taylor)
+        self.taylor_derivative_history.append(self._compute_derivative())
+
+        if taylor > self.max_taylor:
+            self.max_taylor       = taylor
+            self.max_taylor_frame = frame_num
+
+        if len(self.trajectory) > 50:
+            self.trajectory.pop(0)
+
+    # ── summary helpers ───────────────────────────────────────────────────────
+    def post_peak_derivatives(self):
+        return [v for v in self.taylor_derivative_history if not np.isnan(v)]
+
+    def initial_post_peak_dD_dt(self):
+        vals = self.post_peak_derivatives()
+        return vals[0] if vals else None
+
+    def mean_post_peak_dD_dt(self):
+        vals = self.post_peak_derivatives()
+        return float(np.mean(vals)) if vals else None
+
+    def compute_viscoelastic_tau(self):
+        try:
+            idx = self.taylor_history.index(self.max_taylor)
+        except ValueError:
+            return None
+        relax = np.array(self.taylor_history[idx:])
+        if len(relax) < 4 or relax[0] <= 0:
+            return None
+        t     = np.arange(len(relax), dtype=float)
+        log_r = np.log(np.clip(relax / relax[0], 1e-9, None))
+        if np.all(log_r == 0):
+            return None
+        slope, _ = np.polyfit(t, log_r, 1)
+        return (-1.0 / slope) if slope < 0 else None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+class ParticleEngine:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.tracked_particles      = []
+        self.next_particle_id       = 1
+        self.total_unique_particles = 0
+        self.max_distance_threshold = 50
+        self.max_frames_disappeared = 10
+        self.MIN_AREA               = 10
+
+    @staticmethod
+    def fit_ellipse_and_vdiam(contour):
+        """
+        Returns (taylor, major_px, minor_px, vdiam_px).
+
+        taylor    : (L−B)/(L+B) from ellipse axes — dimensionless, unchanged
+        major_px  : ellipse major axis in contour pixels
+        minor_px  : ellipse minor axis in contour pixels
+        vdiam_px  : vertical span of the contour (Y-axis diameter)
+        """
+        vdiam = vertical_diameter_px(contour)
+
+        if len(contour) >= 5:
+            try:
+                (_, _), (ma, mi), _ = cv2.fitEllipse(contour)
+                major = float(max(ma, mi))
+                minor = float(min(ma, mi))
+                L = major / 2.0
+                B = minor / 2.0
+                denom = L + B
+                taylor = float((L - B) / denom) if denom > 0 else 0.0
+                return taylor, major, minor, vdiam
+            except cv2.error:
+                pass
+
+        (_, _), (w, h), _ = cv2.minAreaRect(contour)
+        major = float(max(w, h))
+        minor = float(min(w, h))
+        L = major / 2.0
+        B = minor / 2.0
+        denom = L + B
+        taylor = float((L - B) / denom) if denom > 0 else 0.0
+        return taylor, major, minor, vdiam
+
+    @staticmethod
+    def centroid(contour):
+        M = cv2.moments(contour)
+        if M["m00"] != 0:
+            return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
+        x, y, w, h = cv2.boundingRect(contour)
+        return (x + w//2, y + h//2)
+
+    def _match(self, detections, frame_num):
+        for p in self.tracked_particles:
+            if p.alive and frame_num - p.last_seen > self.max_frames_disappeared:
+                p.alive = False
+        if not detections:
+            return
+        det_cents   = [d['centroid'] for d in detections]
+        alive       = [p for p in self.tracked_particles if p.alive]
+        alive_cents = [p.centroid for p in alive]
+        used_p, used_d, matched = set(), set(), []
+        if alive_cents:
+            dm = cdist(alive_cents, det_cents)
+            while True:
+                tmp = dm.copy()
+                for pi in used_p: tmp[pi, :] = np.inf
+                for di in used_d: tmp[:, di] = np.inf
+                pi, di = np.unravel_index(np.argmin(tmp), tmp.shape)
+                if tmp[pi, di] >= self.max_distance_threshold:
+                    break
+                matched.append((pi, di)); used_p.add(pi); used_d.add(di)
+        for pi, di in matched:
+            d = detections[di]
+            alive[pi].update(d['centroid'], d['area'], d['bbox'],
+                             d['taylor'], d['major_px'], d['minor_px'],
+                             d['vdiam_px'], frame_num)
+        for di, d in enumerate(detections):
+            if di not in used_d:
+                p = Particle(self.next_particle_id,
+                             d['centroid'], d['area'], d['bbox'],
+                             d['taylor'], d['major_px'], d['minor_px'],
+                             d['vdiam_px'], frame_num)
+                self.tracked_particles.append(p)
+                self.next_particle_id       += 1
+                self.total_unique_particles += 1
+
+    def process_frame(self, image, frame_num, zoom_factor=1.0,
+                      min_area=10, um_per_px=1.0):
+        self.MIN_AREA = min_area
+        og_h, og_w = image.shape
+
+        x1, y1, x2, y2 = 0, 0, og_w, og_h
+        cropped = image[y1:y2, x1:x2]
+
+        
+        scale_w    = (x2 - x1) / og_w
+        scale_h    = (y2 - y1) / og_h
+        area_scale = (scale_h * scale_w) / (zoom_factor ** 2)
+
+        blurred = cv2.GaussianBlur(cropped, (7, 7), 0)
+        _, thresh = cv2.threshold(blurred, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if np.sum(thresh == 255) > np.sum(thresh == 0):
+            thresh = cv2.bitwise_not(thresh)
+
+        kernel  = np.ones((2, 2), np.uint8)
+        opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+        sure_bg = cv2.dilate(opening, kernel, iterations=2)
+        dt      = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+        _, sure_fg = cv2.threshold(dt, 0.2 * dt.max(), 255, 0)
+        sure_fg = np.uint8(sure_fg)
+        unknown = cv2.subtract(sure_bg, sure_fg)
+        _, markers = cv2.connectedComponents(sure_fg)
+        markers += 1
+        markers[unknown == 255] = 0
+        color_img = cv2.cvtColor(cropped, cv2.COLOR_GRAY2BGR)
+        markers   = cv2.watershed(color_img, markers)
+        output    = color_img.copy()
+        output[markers == -1] = [0, 0, 255]
+
+        px_to_um = um_per_px / zoom_factor
+
+        detections = []
+        for mv in np.unique(markers):
+            if mv <= 1:
+                continue
+            mask = np.uint8(markers == mv)
+            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in cnts:
+                raw_area  = cv2.contourArea(cnt)
+                norm_area = raw_area * area_scale
+                if norm_area < self.MIN_AREA or cv2.arcLength(cnt, True) <= 0:
+                    continue
+                taylor, major_px, minor_px, vdiam_px = \
+                    self.fit_ellipse_and_vdiam(cnt)
+                detections.append({
+                    'contour' : cnt,
+                    'area'    : norm_area,
+                    'centroid': self.centroid(cnt),
+                    'bbox'    : cv2.boundingRect(cnt),
+                    'taylor'  : taylor,
+                    'major_px': major_px,
+                    'minor_px': minor_px,
+                    'vdiam_px': vdiam_px,
+                })
+
+        self._match(detections, frame_num)
+
+        active = 0
+        for p in self.tracked_particles:
+            if not p.alive or frame_num - p.last_seen > 1:
+                continue
+            active += 1
+            for det in detections:
+                if det['centroid'] == p.centroid:
+                    cv2.drawContours(output, [det['contour']], -1, (0, 255, 0), 2)
+                    x, y = p.centroid
+
+                    vd_um = p.vdiam_history[-1] * px_to_um
+                    cv2.putText(output, f'ID:{p.id}',
+                                (x-20, y-22), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.35, (255, 255, 0), 1)
+                    cv2.putText(output, f'd={vd_um:.1f}\u00b5m',
+                                (x-20, y-12), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.35, (0, 255, 255), 1)
+                    cv2.putText(output, f'T={p.taylor_history[-1]:.3f}',
+                                (x-20, y-2), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.35, (255, 128, 0), 1)
+                    if p.peak_confirmed:
+                        dD = p.taylor_derivative_history[-1]
+                        label = (f'\u2605\u0394T={p.delta_taylor:.3f}'
+                                 if p.delta_taylor is not None else '\u2605peaked')
+                        cv2.putText(output, label,
+                                    (x-20, y+8), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.30, (180, 80, 255), 1)
+
+                    if len(p.trajectory) > 1:
+                        pts = np.array(p.trajectory, np.int32)
+                        cv2.polylines(output, [pts], False,
+                                      tuple(int(c*255) for c in p.color), 1)
+                    cv2.circle(output, p.centroid, 3, (0, 255, 255), -1)
+                    break
+
+        return output, active
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Particle Tracker — Research Edition")
+        self.configure(bg=BG)
+        self.resizable(True, True)
+        self.geometry("1500x980")
+
+        self.video_path   = None
+        self.cap          = None
+        self.engine       = ParticleEngine()
+        self.fps          = 30.0
+        self._zoom_factor = 1.0
+        self._min_area    = 10.0
+        self._um_per_px   = 1.0
+        self.frame_count  = 0
+        self.running      = False
+        self.paused       = False
+        self._thread      = None
+        self._stop_event  = threading.Event()
+        self.total_frames = 0
+        self.output_dir   = os.path.expanduser("~")
+
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        # ── top bar ──────────────────────────────────────────────────────────
+        top = tk.Frame(self, bg=PANEL, pady=8, padx=14)
+        top.pack(fill=tk.X)
+        tk.Label(top, text="⬡  PARTICLE TRACKER  — Research Edition",
+                 bg=PANEL, fg=ACCENT,
+                 font=("Segoe UI Semibold", 13)).pack(side=tk.LEFT)
+        btn_frame = tk.Frame(top, bg=PANEL)
+        btn_frame.pack(side=tk.RIGHT)
+        self._btn = {}
+        defs = [
+            ("Browse Video", ACCENT,    self._browse,  "browse"),
+            ("▶  Start",     ACCENT2,   self._start,   "start"),
+            ("⏸  Pause",     WARN,      self._pause,   "pause"),
+            ("⏹  Stop",      "#da3633", self._stop,    "stop"),
+            ("Export CSV",   "#bc8cff", self._export,  "export"),
+        ]
+        for label, color, cmd, key in defs:
+            b = tk.Button(btn_frame, text=label, bg=BORDER, fg=color,
+                          font=FONT_HEAD, relief=tk.FLAT, padx=12, pady=5,
+                          activebackground=BORDER, activeforeground=TEXT,
+                          cursor="hand2", command=cmd)
+            b.pack(side=tk.LEFT, padx=3)
+            self._btn[key] = b
+        self._btn["pause"].config(state=tk.DISABLED)
+        self._btn["stop"].config(state=tk.DISABLED)
+        self._btn["export"].config(state=tk.DISABLED)
+        self._btn["start"].config(state=tk.DISABLED)
+
+        # ── parameter row ─────────────────────────────────────────────────────
+        pr = tk.Frame(self, bg=PANEL, pady=8, padx=14)
+        pr.pack(fill=tk.X)
+        tk.Label(pr, text="VIDEO PARAMETERS", bg=PANEL, fg=SUBTEXT,
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(0, 10))
+
+        def make_field(parent, label, tip, default):
+            cell = tk.Frame(parent, bg=PANEL)
+            cell.pack(side=tk.LEFT, padx=(0, 18))
+            tk.Label(cell, text=label, bg=PANEL, fg=TEXT,
+                     font=("Segoe UI Semibold", 9)).pack(anchor=tk.W)
+            tk.Label(cell, text=tip, bg=PANEL, fg=SUBTEXT,
+                     font=("Segoe UI", 7)).pack(anchor=tk.W)
+            var = tk.StringVar(value=str(default))
+            ent = tk.Entry(cell, textvariable=var, bg=BORDER, fg=TEXT,
+                           insertbackground=TEXT, relief=tk.FLAT,
+                           font=FONT_MONO, width=10,
+                           highlightthickness=1,
+                           highlightbackground=BORDER,
+                           highlightcolor=ACCENT)
+            ent.pack(anchor=tk.W, pady=(2, 0))
+            return var
+
+        self._fps_var     = make_field(pr, "FPS", "auto-detected", "30.00")
+        self._zoom_var    = make_field(pr, "Zoom ×", "optical magnification", "1.0")
+        self._minarea_var = make_field(pr, "Min Area px²", "smallest blob", "10")
+        self._umpx_var    = make_field(pr, "µm/px @ 1×", "calibration", "1.0")
+
+        tk.Button(pr, text="✓ Apply", bg=BORDER, fg=ACCENT2,
+                  font=FONT_HEAD, relief=tk.FLAT, padx=8, pady=4,
+                  activebackground=BORDER, cursor="hand2",
+                  command=self._apply_params).pack(side=tk.LEFT, padx=(0, 8))
+        self._param_status = tk.Label(pr, text="", bg=PANEL, fg=ACCENT2,
+                                      font=("Segoe UI", 8))
+        self._param_status.pack(side=tk.LEFT)
+
+        # ── progress bar ──────────────────────────────────────────────────────
+        pf = tk.Frame(self, bg=BG, pady=3, padx=14)
+        pf.pack(fill=tk.X)
+        self.progress = ttk.Progressbar(pf, orient=tk.HORIZONTAL,
+                                        mode='determinate', length=400)
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("TProgressbar", troughcolor=BORDER,
+                        background=ACCENT, thickness=5)
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.lbl_progress = tk.Label(pf, text="No video loaded",
+                                     bg=BG, fg=SUBTEXT, font=FONT_UI)
+        self.lbl_progress.pack(side=tk.LEFT, padx=8)
+
+        # ── stat cards row ────────────────────────────────────────────────────
+        sc = tk.Frame(self, bg=BG, pady=4, padx=10)
+        sc.pack(fill=tk.X)
+        self._stat_vars = {}
+        stat_defs = [
+            ("total_particles", "TOTAL PARTICLES",   "0",   ACCENT),
+            ("active",          "ACTIVE NOW",         "0",   ACCENT2),
+            ("mean_vdiam",      "MEAN Y-DIAM (µm)",   "—",   "#e3b341"),
+            ("mean_taylor",     "MEAN MAX TAYLOR",    "—",   WARN),
+            ("peaked",          "PEAKS CONFIRMED",    "0",   "#bc8cff"),
+            ("mean_dT",         "MEAN |ΔT| @ PEAK",  "—",   "#ff7b72"),
+        ]
+        for i, (key, label, init, color) in enumerate(stat_defs):
+            card = tk.Frame(sc, bg=PANEL, padx=10, pady=7, relief=tk.FLAT)
+            card.grid(row=0, column=i, padx=3, sticky=tk.EW)
+            sc.columnconfigure(i, weight=1)
+            tk.Label(card, text=label, bg=PANEL, fg=SUBTEXT,
+                     font=("Segoe UI", 7, "bold")).pack()
+            var = tk.StringVar(value=init)
+            self._stat_vars[key] = var
+            tk.Label(card, textvariable=var, bg=PANEL, fg=color,
+                     font=("Segoe UI Semibold", 14)).pack()
+
+        # ── main body ─────────────────────────────────────────────────────────
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        # Left column: live preview
+        left = tk.Frame(body, bg=PANEL)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False,
+                  padx=(0, 4), pady=0)
+        left.configure(width=430)
+        left.pack_propagate(False)
+
+        tk.Label(left, text="LIVE PREVIEW", bg=PANEL, fg=SUBTEXT,
+                 font=("Segoe UI", 8)).pack(anchor=tk.W, padx=8, pady=(5, 2))
+        self.canvas_video = tk.Label(left, bg="#000000")
+        self.canvas_video.pack(padx=8, pady=(0, 8), fill=tk.BOTH, expand=True)
+
+        # Middle column: graphs
+        mid = tk.Frame(body, bg=BG)
+        mid.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+
+        self.fig = Figure(figsize=(6.0, 7.5), facecolor=PANEL, tight_layout=True)
+        self.fig.patch.set_facecolor(PANEL)
+        self._ax_diam   = self.fig.add_subplot(2, 1, 1)   # Y-diameter per particle
+        self._ax_taylor = self.fig.add_subplot(2, 1, 2)   # Taylor per particle
+
+        for ax in (self._ax_diam, self._ax_taylor):
+            ax.set_facecolor(BG)
+            ax.tick_params(colors=SUBTEXT, labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(BORDER)
+            ax.grid(True, color=BORDER, linewidth=0.5)
+
+        self._ax_diam.set_title("Vertical diameter per particle  (µm)",
+                                color=TEXT, fontsize=8)
+        self._ax_diam.set_xlabel("Frame", color=SUBTEXT, fontsize=7)
+        self._ax_diam.set_ylabel("Y-diameter  (µm)", color=SUBTEXT, fontsize=7)
+
+        self._ax_taylor.set_title("Taylor parameter per particle",
+                                  color=TEXT, fontsize=8)
+        self._ax_taylor.set_xlabel("Frame", color=SUBTEXT, fontsize=7)
+        self._ax_taylor.set_ylabel("D  (Taylor)", color=SUBTEXT, fontsize=7)
+        self._ax_taylor.set_ylim(-0.05, 1.05)
+
+        self.canvas_plot = FigureCanvasTkAgg(self.fig, master=mid)
+        self.canvas_plot.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Right column: data table
+        right = tk.Frame(body, bg=PANEL)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, pady=0)
+        right.configure(width=490)
+        right.pack_propagate(False)
+
+        tk.Label(right, text="PEAK ANALYSIS TABLE", bg=PANEL, fg=SUBTEXT,
+                 font=("Segoe UI", 8, "bold")).pack(anchor=tk.W,
+                                                    padx=8, pady=(5, 2))
+
+        table_frame = tk.Frame(right, bg=PANEL)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+        col_defs = [
+            ("ID",           40),
+            ("T before",     70),
+            ("T at peak",    70),
+            ("T after",      70),
+            ("ΔT (A−B)",     75),
+            ("V before\n(µm/s)", 80),
+            ("V after\n(µm/s)",  80),
+        ]
+        style.configure("Research.Treeview",
+                        background=BG, foreground=TEXT,
+                        rowheight=22, fieldbackground=BG,
+                        borderwidth=0, font=("Courier New", 9))
+        style.configure("Research.Treeview.Heading",
+                        background=BORDER, foreground=SUBTEXT,
+                        font=("Segoe UI", 8, "bold"), relief=tk.FLAT)
+        style.map("Research.Treeview",
+                  background=[('selected', BORDER)],
+                  foreground=[('selected', ACCENT)])
+
+        self._table = ttk.Treeview(
+            table_frame,
+            columns=[c for c, _ in col_defs],
+            show='headings',
+            style="Research.Treeview"
+        )
+        for col, width in col_defs:
+            self._table.heading(col, text=col)
+            self._table.column(col, width=width, anchor=tk.CENTER,
+                               stretch=True)
+        sb = ttk.Scrollbar(table_frame, orient=tk.VERTICAL,
+                           command=self._table.yview)
+        self._table.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._table.pack(fill=tk.BOTH, expand=True)
+
+        # ── log ───────────────────────────────────────────────────────────────
+        log_frame = tk.Frame(self, bg=PANEL, height=80)
+        log_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=8, pady=(0, 6))
+        log_frame.pack_propagate(False)
+        tk.Label(log_frame, text="LOG", bg=PANEL, fg=SUBTEXT,
+                 font=("Segoe UI", 8)).pack(anchor=tk.W, padx=8, pady=(3, 0))
+        self.log_box = tk.Text(log_frame, bg=PANEL, fg=SUBTEXT,
+                               font=FONT_MONO, state=tk.DISABLED,
+                               relief=tk.FLAT, wrap=tk.WORD, height=3)
+        self.log_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 3))
+
+    # ── param helpers ─────────────────────────────────────────────────────────
+    def _parse_params(self):
+        fps = float(self._fps_var.get())
+        if fps <= 0: raise ValueError("Frame rate must be > 0")
+        zoom = float(self._zoom_var.get())
+        if zoom <= 0: raise ValueError("Zoom factor must be > 0")
+        min_area = float(self._minarea_var.get())
+        if min_area < 0: raise ValueError("Min area must be >= 0")
+        um_per_px = float(self._umpx_var.get())
+        if um_per_px <= 0: raise ValueError("Calibration (µm/px) must be > 0")
+        return fps, zoom, min_area, um_per_px
+
+    def _apply_params(self):
+        try:
+            fps, zoom, min_area, um_per_px = self._parse_params()
+        except (ValueError, TypeError) as e:
+            messagebox.showerror("Parameter error", str(e)); return
+        self.fps, self._zoom_factor = fps, zoom
+        self._min_area, self._um_per_px = min_area, um_per_px
+        eff = um_per_px / zoom
+        self._param_status.config(
+            text=(f"✓ fps={fps}  zoom={zoom}×  min_area={min_area}px²  "
+                  f"{um_per_px}µm/px@1×  → eff {eff:.4f}µm/px"), fg=ACCENT2)
+        self._log(f"Params applied → fps={fps}  zoom={zoom}×  "
+                  f"min_area={min_area}px²  eff={eff:.4f}µm/px")
+
+    def _log(self, msg):
+        self.log_box.configure(state=tk.NORMAL)
+        self.log_box.insert(tk.END, f"[{time.strftime('%H:%M:%S')}]  {msg}\n")
+        self.log_box.see(tk.END)
+        self.log_box.configure(state=tk.DISABLED)
+
+    def _browse(self):
+        path = filedialog.askopenfilename(
+            title="Select video file",
+            filetypes=[("Video files", "*.avi *.mp4 *.mov *.mkv *.wmv"),
+                       ("All files", "*.*")])
+        if not path: return
+        self.video_path = path
+        self.output_dir = os.path.dirname(path)
+        self._log(f"Loaded: {os.path.basename(path)}")
+        self._btn["start"].config(state=tk.NORMAL)
+        self.lbl_progress.config(text=os.path.basename(path))
+        tmp = cv2.VideoCapture(path)
+        self.total_frames = int(tmp.get(cv2.CAP_PROP_FRAME_COUNT))
+        det_fps = tmp.get(cv2.CAP_PROP_FPS); tmp.release()
+        if det_fps > 0:
+            self.fps = det_fps
+            self._fps_var.set(f"{det_fps:.2f}")
+            self._log(f"  Auto-detected fps={det_fps:.2f}  |  {self.total_frames} frames")
+        self.progress["maximum"] = max(self.total_frames, 1)
+        self._param_status.config(text="")
+
+    def _start(self):
+        if self.running: return
+        try:
+            fps, zoom, min_area, um_per_px = self._parse_params()
+        except (ValueError, TypeError) as e:
+            messagebox.showerror("Parameter error", str(e)); return
+        self.fps, self._zoom_factor = fps, zoom
+        self._min_area, self._um_per_px = min_area, um_per_px
+        self.engine.reset()
+        self.frame_count = 0
+        self.cap = cv2.VideoCapture(self.video_path)
+        if not self.cap.isOpened():
+            messagebox.showerror("Error", "Cannot open video file."); return
+        self.running = True; self.paused = False
+        self._stop_event.clear()
+        self._btn["start"].config(state=tk.DISABLED)
+        self._btn["pause"].config(state=tk.NORMAL)
+        self._btn["stop"].config(state=tk.NORMAL)
+        self._btn["export"].config(state=tk.DISABLED)
+        eff = um_per_px / zoom
+        self._log(f"Tracking started → fps={fps}  zoom={zoom}×  eff={eff:.4f}µm/px  "
+                  f"peak_confirm={PEAK_CONFIRM_FRAMES}f  deriv_win={DERIV_WINDOW}f")
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def _pause(self):
+        if not self.running: return
+        self.paused = not self.paused
+        self._btn["pause"].config(text="▶  Resume" if self.paused else "⏸  Pause")
+        self._log("Paused." if self.paused else "Resumed.")
+
+    def _stop(self):
+        self._stop_event.set(); self.running = False; self.paused = False
+        self._btn["pause"].config(text="⏸  Pause", state=tk.DISABLED)
+        self._btn["stop"].config(state=tk.DISABLED)
+        self._btn["start"].config(state=tk.NORMAL)
+        self._btn["export"].config(state=tk.NORMAL)
+        self._log("Stopped.")
+
+    def _run_loop(self):
+        plot_interval = 5
+        while not self._stop_event.is_set():
+            if self.paused: time.sleep(0.05); continue
+            ret, frame = self.cap.read()
+            if not ret: self.after(0, self._on_video_end); break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) \
+                   if len(frame.shape) == 3 else frame
+            processed, active = self.engine.process_frame(
+                gray, self.frame_count,
+                zoom_factor=self._zoom_factor,
+                min_area=self._min_area,
+                um_per_px=self._um_per_px)
+            snap = (processed.copy(), active,
+                    self.frame_count, self.engine.total_unique_particles)
+            self.after(0, self._update_gui, snap)
+            if self.frame_count % plot_interval == 0:
+                self.after(0, self._update_plots)
+                self.after(0, self._update_table)
+            self.frame_count += 1
+        if self.cap: self.cap.release()
+
+    def _on_video_end(self):
+        self._log(f"Video complete — "
+                  f"{self.engine.total_unique_particles} unique particles.")
+        self._stop()
+        self._update_plots()
+        self._update_table()
+
+    # ── GUI update ────────────────────────────────────────────────────────────
+    def _update_gui(self, snapshot):
+        processed, active, fc, unique = snapshot
+        px_to_um = self._um_per_px / self._zoom_factor
+
+        rgb   = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
+        cw    = self.canvas_video.winfo_width()  or 420
+        ch    = self.canvas_video.winfo_height() or 480
+        h, w  = rgb.shape[:2]
+        scale = min(cw / w, ch / h)
+        nw, nh = max(1, int(w*scale)), max(1, int(h*scale))
+        rgb = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        img = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.canvas_video.configure(image=img); self.canvas_video.image = img
+
+        # progress bar
+        if self.total_frames > 0:
+            self.progress["value"] = fc
+            pct = fc / self.total_frames * 100
+            self.lbl_progress.config(
+                text=f"{fc}/{self.total_frames}  ({pct:.1f}%)")
+
+        particles = self.engine.tracked_particles
+
+        self._stat_vars["total_particles"].set(str(unique))
+        self._stat_vars["active"].set(str(active))
+
+        all_vd = [np.mean(p.vdiam_history) * px_to_um
+                  for p in particles if p.vdiam_history]
+        self._stat_vars["mean_vdiam"].set(
+            f"{np.mean(all_vd):.2f}" if all_vd else "—")
+
+        max_t = [p.max_taylor for p in particles]
+        self._stat_vars["mean_taylor"].set(
+            f"{np.mean(max_t):.4f}" if max_t else "—")
+
+        peaked_count = sum(1 for p in particles if p.peak_confirmed)
+        self._stat_vars["peaked"].set(str(peaked_count))
+
+        dts = [abs(p.delta_taylor) for p in particles
+               if p.delta_taylor is not None]
+        self._stat_vars["mean_dT"].set(
+            f"{np.mean(dts):.4f}" if dts else "—")
+
+    # ── plots ─────────────────────────────────────────────────────────────────
+    def _update_plots(self):
+        particles = self.engine.tracked_particles
+        px_to_um  = self._um_per_px / self._zoom_factor
+
+        for ax in (self._ax_diam, self._ax_taylor):
+            ax.clear()
+            ax.set_facecolor(BG)
+            ax.tick_params(colors=SUBTEXT, labelsize=7)
+            for sp in ax.spines.values(): sp.set_edgecolor(BORDER)
+            ax.grid(True, color=BORDER, linewidth=0.5)
+
+        # Vertical diameter graph
+        ax = self._ax_diam
+        ax.set_title("Vertical (Y-axis) diameter per particle  (µm)",
+                     color=TEXT, fontsize=8)
+        ax.set_xlabel("Frame", color=SUBTEXT, fontsize=7)
+        ax.set_ylabel("Y-diameter  (µm)", color=SUBTEXT, fontsize=7)
+        for p in particles:
+            if len(p.vdiam_history) > 1:
+                vd_um = [v * px_to_um for v in p.vdiam_history]
+                ax.plot(p.frame_history, vd_um,
+                        color=p.color,
+                        alpha=0.9 if p.alive else 0.35,
+                        linewidth=1.2,
+                        label=f'P{p.id}')
+        hdl, lbl = ax.get_legend_handles_labels()
+        if hdl:
+            ax.legend(fontsize=5, loc='upper left',
+                      facecolor=PANEL, labelcolor=TEXT, ncol=3)
+
+        # Taylor graph
+        ax = self._ax_taylor
+        ax.set_title("Taylor parameter per particle", color=TEXT, fontsize=8)
+        ax.set_xlabel("Frame", color=SUBTEXT, fontsize=7)
+        ax.set_ylabel("D  (Taylor)", color=SUBTEXT, fontsize=7)
+        ax.set_ylim(-0.05, 1.05)
+        for p in particles:
+            if len(p.taylor_history) > 1:
+                ax.plot(p.frame_history, p.taylor_history,
+                        color=p.color,
+                        alpha=0.9 if p.alive else 0.35,
+                        linewidth=1.2)
+                ax.plot(p.max_taylor_frame, p.max_taylor,
+                        '*', color=p.color, markersize=7,
+                        label=f'P{p.id} peak={p.max_taylor:.3f}')
+                if p.peak_confirmed:
+                    ax.axvline(p.peak_confirmed_frame,
+                               color=p.color, linestyle=':', alpha=0.35,
+                               linewidth=0.8)
+        hdl, lbl = ax.get_legend_handles_labels()
+        if hdl:
+            ax.legend(fontsize=5, loc='upper left',
+                      facecolor=PANEL, labelcolor=TEXT, ncol=3)
+
+        self.fig.tight_layout(pad=1.2)
+        self.canvas_plot.draw_idle()
+
+    # ── table update ──────────────────────────────────────────────────────────
+    def _update_table(self):
+        """Refresh the peak analysis table — only show particles that have
+        passed through the peak-confirmation logic."""
+        px_to_um  = self._um_per_px / self._zoom_factor
+        fps       = self.fps
+        particles = self.engine.tracked_particles
+
+        # Clear existing rows
+        for row in self._table.get_children():
+            self._table.delete(row)
+
+        for p in particles:
+            # Show all particles; blanks where data not yet available
+            tb = f"{p.taylor_before_peak:.4f}" \
+                 if p.taylor_before_peak is not None else "—"
+            tp = f"{p.max_taylor:.4f}"
+            ta = f"{p.taylor_after_peak:.4f}" \
+                 if p.taylor_after_peak is not None else "—"
+            dt = f"{p.delta_taylor:+.4f}" \
+                 if p.delta_taylor is not None else "—"
+
+            vb = (f"{p.velocity_before_peak * fps * px_to_um:.2f}"
+                  if p.velocity_before_peak is not None else "—")
+            va = (f"{p.velocity_after_peak * fps * px_to_um:.2f}"
+                  if p.velocity_after_peak is not None else "—")
+
+            tag = "peaked" if p.peak_confirmed else "tracking"
+            self._table.insert("", tk.END,
+                               values=(p.id, tb, tp, ta, dt, vb, va),
+                               tags=(tag,))
+
+        # Colour peaked rows
+        self._table.tag_configure("peaked",   foreground="#bc8cff")
+        self._table.tag_configure("tracking", foreground=TEXT)
+
+    # ── export ────────────────────────────────────────────────────────────────
+    def _export(self):
+        if not self.engine.tracked_particles:
+            messagebox.showinfo("Export", "No tracking data to export.")
+            return
+        ts        = time.strftime('%Y%m%d_%H%M%S')
+        fps       = self.fps
+        zoom      = self._zoom_factor
+        mina      = self._min_area
+        um_per_px = self._um_per_px
+        px_to_um  = um_per_px / zoom
+        particles = self.engine.tracked_particles
+
+        # ── 1. time-series CSV ────────────────────────────────────────────────
+        ts_path = os.path.join(self.output_dir, f'particle_timeseries_{ts}.csv')
+        with open(ts_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['# capture_fps', fps, 'zoom_factor', zoom,
+                        'um_per_px_at_1x', um_per_px,
+                        'effective_um_per_px', px_to_um,
+                        'min_area_px2', mina,
+                        'peak_confirm_frames', PEAK_CONFIRM_FRAMES,
+                        'deriv_window_frames', DERIV_WINDOW])
+            w.writerow([
+                'particle_id', 'frame',
+                'major_axis_px',   'major_axis_um',
+                'minor_axis_px',   'minor_axis_um',
+                'vdiam_px',        'vdiam_um',
+                'taylor_parameter',
+                'velocity_px_per_s', 'velocity_um_per_s',
+                'frames_after_max_taylor',
+                'dD_dt',
+                'peak_confirmed',
+            ])
+            for p in particles:
+                vel_px_s = [v * fps for v in p.velocity_history]
+                vel_um_s = [v * fps * px_to_um for v in p.velocity_history]
+                for i in range(len(p.frame_history)):
+                    vel_px = f'{vel_px_s[i-1]:.4f}' \
+                             if i > 0 and (i-1) < len(vel_px_s) else ''
+                    vel_um = f'{vel_um_s[i-1]:.4f}' \
+                             if i > 0 and (i-1) < len(vel_um_s) else ''
+                    maj_px = p.major_history[i]
+                    min_px = p.minor_history[i]
+                    vd_px  = p.vdiam_history[i]
+                    dD_val = p.taylor_derivative_history[i]
+                    dD_str = f'{dD_val:.6f}' if not np.isnan(dD_val) else ''
+                    w.writerow([
+                        p.id, p.frame_history[i],
+                        f'{maj_px:.4f}', f'{maj_px * px_to_um:.4f}',
+                        f'{min_px:.4f}', f'{min_px * px_to_um:.4f}',
+                        f'{vd_px:.4f}',  f'{vd_px  * px_to_um:.4f}',
+                        f'{p.taylor_history[i]:.6f}',
+                        vel_px, vel_um,
+                        p.frame_history[i] - p.max_taylor_frame,
+                        dD_str,
+                        1 if p.peak_confirmed and
+                             p.frame_history[i] >= (p.peak_confirmed_frame or 0)
+                          else 0,
+                    ])
+
+        # ── 2. peak-analysis summary CSV ──────────────────────────────────────
+        peak_path = os.path.join(self.output_dir,
+                                 f'particle_peak_analysis_{ts}.csv')
+        with open(peak_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['# capture_fps', fps, 'zoom_factor', zoom,
+                        'um_per_px_at_1x', um_per_px,
+                        'effective_um_per_px', px_to_um,
+                        'min_area_px2', mina,
+                        'peak_confirm_frames', PEAK_CONFIRM_FRAMES,
+                        'deriv_window_frames', DERIV_WINDOW])
+            w.writerow([
+                'particle_id',
+                'total_frames_tracked',
+                'max_taylor_parameter',
+                'frame_of_max_taylor',
+                'taylor_before_peak',
+                'taylor_at_peak',
+                'taylor_after_peak',
+                'delta_taylor_after_minus_before',   # signed: after − before
+                'abs_delta_taylor',
+                'peak_confirmed',
+                'peak_confirmed_frame',
+                'velocity_before_peak_um_per_s',
+                'velocity_after_peak_um_per_s',
+                'velocity_delta_um_per_s',           # after − before
+                'mean_vdiam_um',
+                'std_vdiam_um',
+                'min_vdiam_um',
+                'max_vdiam_um',
+                'mean_major_um',
+                'mean_minor_um',
+                'initial_dD_dt_post_peak',
+                'mean_dD_dt_post_peak',
+                'viscoelastic_tau_frames',
+                'viscoelastic_tau_seconds',
+            ])
+            for p in particles:
+                vd_arr = np.array(p.vdiam_history) * px_to_um
+                maj_arr = np.array(p.major_history) * px_to_um
+                min_arr = np.array(p.minor_history) * px_to_um
+
+                vb = (p.velocity_before_peak * fps * px_to_um
+                      if p.velocity_before_peak is not None else None)
+                va = (p.velocity_after_peak  * fps * px_to_um
+                      if p.velocity_after_peak  is not None else None)
+                vd_vel = ((va - vb) if (vb is not None and va is not None)
+                          else None)
+
+                tau_fr = p.compute_viscoelastic_tau()
+                tau_s  = tau_fr / fps if tau_fr else None
+
+                init_dD = p.initial_post_peak_dD_dt()
+                mean_dD = p.mean_post_peak_dD_dt()
+
+                def fmt(v, d=6): return f'{v:.{d}f}' if v is not None else ''
+
+                w.writerow([
+                    p.id,
+                    len(p.frame_history),
+                    fmt(p.max_taylor),
+                    p.max_taylor_frame,
+                    fmt(p.taylor_before_peak),
+                    fmt(p.max_taylor),
+                    fmt(p.taylor_after_peak),
+                    fmt(p.delta_taylor),
+                    fmt(abs(p.delta_taylor) if p.delta_taylor is not None else None),
+                    1 if p.peak_confirmed else 0,
+                    p.peak_confirmed_frame if p.peak_confirmed else '',
+                    fmt(vb, 4),
+                    fmt(va, 4),
+                    fmt(vd_vel, 4),
+                    fmt(float(np.mean(vd_arr)), 4),
+                    fmt(float(np.std(vd_arr)),  4),
+                    fmt(float(np.min(vd_arr)),  4),
+                    fmt(float(np.max(vd_arr)),  4),
+                    fmt(float(np.mean(maj_arr)), 4),
+                    fmt(float(np.mean(min_arr)), 4),
+                    fmt(init_dD),
+                    fmt(mean_dD),
+                    fmt(tau_fr, 4)  if tau_fr  else '',
+                    fmt(tau_s,  6)  if tau_s   else '',
+                ])
+
+        # ── 3. size distribution CSV ──────────────────────────────────────────
+        dist_path = os.path.join(self.output_dir,
+                                 f'particle_size_distribution_{ts}.csv')
+        with open(dist_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['# capture_fps', fps, 'zoom_factor', zoom,
+                        'um_per_px_at_1x', um_per_px,
+                        'effective_um_per_px', px_to_um])
+            w.writerow([
+                'particle_id',
+                'mean_vdiam_um', 'std_vdiam_um',
+                'mean_major_um', 'mean_minor_um',
+                'mean_taylor_parameter',
+            ])
+            for p in particles:
+                vd_arr  = np.array(p.vdiam_history) * px_to_um
+                maj_arr = np.array(p.major_history)  * px_to_um
+                min_arr = np.array(p.minor_history)  * px_to_um
+                w.writerow([
+                    p.id,
+                    f'{np.mean(vd_arr):.4f}', f'{np.std(vd_arr):.4f}',
+                    f'{np.mean(maj_arr):.4f}', f'{np.mean(min_arr):.4f}',
+                    f'{np.mean(p.taylor_history):.6f}',
+                ])
+
+        self._log(f"Exported → {os.path.basename(ts_path)}")
+        self._log(f"Exported → {os.path.basename(peak_path)}")
+        self._log(f"Exported → {os.path.basename(dist_path)}")
+        messagebox.showinfo(
+            "Export complete",
+            f"Saved 3 files:\n\n"
+            f"1. {ts_path}\n\n"
+            f"2. {peak_path}\n\n"
+            f"3. {dist_path}")
+
+    def _on_close(self):
+        self._stop_event.set(); self.running = False
+        if self.cap: self.cap.release()
+        self.destroy()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
